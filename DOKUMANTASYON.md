@@ -304,8 +304,9 @@ gerek yoktur. Onun yerine **sağlam mühendislik**:
   `robots.txt`'i okunur; istek, sayfa istekleri gibi SSRF korumasından geçer. Sonuç worker süreci
   başına önbelleğe alınır: okunan (ya da kesin sonuç veren) robots.txt 1 saat, okunamayan
   (`5xx`, ağ hatası, zaman aşımı) 5 dakika. `401/403` her şeyi yasaklar, diğer `4xx` her şeyi
-  serbest bırakır. robots.txt okunamazsa sayfa **izinli sayılır** (daha önce okunan kurallar varsa
-  onlar geçerli kalır).
+  serbest bırakır. robots.txt okunamazsa, o alan adı için daha önce okunan kurallar varsa dosya
+  yeniden okunana kadar **son okunan kurallar** geçerli kalır (5 dakikada bir yeniden denenir);
+  hiç okunamamışsa sayfa **izinli sayılır**.
 - **SSRF koruması (`core/netguard.py`):** Sayfa istekleri `guarded_request` üzerinden gider. Yalnız
   `http`/`https`; ana makine adı çözülür ve çözülen adreslerden biri bile genel değilse
   (loopback, özel ağ, link-local/bulut metadata, CGNAT, IPv6 ULA vb.) istek gönderilmez.
@@ -591,9 +592,9 @@ zorlar (gerçek Redis gerektirmez) ve güvenlik ayarlarını varsayılana çekip
 | `test_parser.py` | HTML'den doğru `Book` çıkarımı + JSON-LD/meta/regex fallback'leri |
 | `test_dedup.py` | İlk görüş `False`, ikinci görüş `True`; URL normalizasyonu; dilimli ömür (en az `DEDUP_TTL`, kayıtlar tek tek düşer, sonunda silinir) |
 | `test_db.py` | Aynı URL iki kez upsert → tek satır (duplicate yok), alanlar güncellenir |
-| `test_discover.py` | Chunk dağıtımı (eager mod): 5 kitap → 3 chunk → hepsi DB'de; per-url fallback; bir URL'nin hatası chunk'ı düşürmez; webhook her modda tam bir kez ve URL sayısıyla |
+| `test_discover.py` | Chunk dağıtımı (eager mod): 5 kitap → 3 chunk → hepsi DB'de; per-url fallback; bir URL'nin hatası chunk'ı düşürmez; webhook her modda tam bir kez ve URL sayısıyla; ayrıştırılamayan katalog bağlantısı atlanır, koşuyu düşürmez |
 | `test_scrape_book.py` | URL ve içerik özeti yalnız başarılı yazımdan sonra işaretlenir; başarısız deneme yeniden çekilir; `force`; dead-letter `kwargs` |
-| `test_fetcher.py` | robots.txt alan adı başına ve önbellekli; okunamazsa izinli; `5xx`'te geri çekilip yeniden deneme; son denemeden sonra bekleme yok |
+| `test_fetcher.py` | robots.txt alan adı başına ve önbellekli; okunamazsa son okunan kurallar, hiç okunamamışsa izinli; `5xx`'te geri çekilip yeniden deneme; son denemeden sonra bekleme yok |
 | `test_ops_endpoints.py` | `/health` Redis denetimi (Redis kapalıyken hızlı `false`); dead-letter en yeni önce ve sınırlı |
 | `test_incremental.py` | Domain-bazlı gecikme + `content_changed` (yeni→aynı→değişti) |
 | `test_deadletter.py` | Fetch hatası `FetchError` fırlatır; `on_failure` dead-letter'a yazar |
@@ -682,7 +683,8 @@ C: Küçük demolarda 1 (per-url, izlemesi kolay). Büyük ölçekte 10–50 ara
 
 - Hedef site (books.toscrape.com) scraping pratiği için **kasıtla** yayınlanmıştır.
 - `core/fetcher.py` **robots.txt'e saygı** duyar ve **nezaket gecikmesi** uygular. robots.txt
-  okunamazsa sayfa izinli sayılır ([Bölüm 7](#7-katman-34--nazik-indirme)).
+  okunamazsa son okunan kurallar geçerli kalır, hiç okunamamışsa sayfa izinli sayılır
+  ([Bölüm 7](#7-katman-34--nazik-indirme)).
 - Başka bir siteye yönlendirirken: kullanım şartlarını, robots.txt'i ve ilgili veri koruma
   mevzuatını (ör. **KVKK/GDPR**) kontrol et. **Anti-bot savunması olan sitelerde izinsiz
   kullanma.** Bu proje, izin veren hedeflerde doğru mühendisliği öğretmek içindir; izinsiz

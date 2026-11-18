@@ -203,6 +203,37 @@ def test_per_url_mode_webhook_fires_when_a_url_fails(eager, monkeypatch, requeue
     assert requeued == [((failed,), {"force": False, "use_ai": False})]
 
 
+# --------------------------------------------------------------------------
+# Hedef sitedeki ayrıştırılamayan bir bağlantı (urljoin ValueError) koşuyu düşürmemeli:
+# bozuk ürün bağlantısı atlanır, bozuk "sonraki sayfa" bağlantısında sayfalama biter.
+# --------------------------------------------------------------------------
+BAD_CATALOG = """
+<html><body>
+  <article class="product_pod"><h3><a href="book-1.html">B1</a></h3></article>
+  <article class="product_pod"><h3><a href="https://[cdn]/b.html">Bozuk</a></h3></article>
+  <article class="product_pod"><h3><a href="book-2.html">B2</a></h3></article>
+  <ul class="pager"><li class="next"><a href="https://[cdn]/page-2.html">next</a></li></ul>
+</body></html>
+"""
+
+
+@pytest.mark.parametrize("chunk_size", [10, 1], ids=["chunked", "per_url"])
+def test_malformed_catalog_links_do_not_fail_run(eager, monkeypatch, webhook_sent, chunk_size):
+    monkeypatch.setattr(
+        tasks.fetcher, "get", lambda url: BAD_CATALOG if "page-" in url else _fake_get(url)
+    )
+    res = tasks.discover_catalog.apply(
+        args=[None, 3, chunk_size], kwargs={"webhook_url": HOOK}
+    ).get()
+    assert res["books_dispatched"] == 2           # bozuk ürün bağlantısı atlandı
+    assert count_books() == 2
+    assert len(webhook_sent) == 1
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"]) == (2, 2)
+    assert body["meta"]["books_dispatched"] == 2
+    assert body["meta"]["pages_scanned"] == 1     # bozuk "sonraki" -> sayfalama biter
+
+
 def test_webhook_callback_flattens_chunk_results(webhook_sent):
     nested = [
         [{"status": "ok"}, {"status": "ok"}],

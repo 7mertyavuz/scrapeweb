@@ -141,6 +141,18 @@ def scrape_chunk(urls: list[str], use_ai: bool = False) -> list[dict]:
             results.append({"url": url, "status": "requeued", "error": repr(exc)})
     return results
 
+def _join_link(base: str, href) -> str | None:
+    """Sayfadaki bağlantıyı mutlak URL'ye çevir; ayrıştırılamıyorsa None.
+
+    Hedef sitenin içeriği (ör. `https://[cdn]/b.html`) urljoin'de ValueError
+    fırlatabilir; tek bir bozuk bağlantı tüm keşif koşusunu düşürmemeli.
+    """
+    try:
+        return urljoin(base, href)
+    except ValueError:
+        logger.warning("[discover] ayrıştırılamayan bağlantı atlandı: %r (sayfa: %s)", href, base)
+        return None
+
 @shared_task(bind=True, name="workers.discover_catalog")
 def discover_catalog(
     self,
@@ -162,10 +174,13 @@ def discover_catalog(
 
         for a in soup.select("article.product_pod h3 a"):
             href = a.get("href", "")
-            book_urls.append(urljoin(page_url, href))
+            book_url = _join_link(page_url, href)
+            if book_url:   # ayrıştırılamayan ürün bağlantısı atlanır
+                book_urls.append(book_url)
 
         nxt = soup.select_one("li.next a")
-        page_url = urljoin(page_url, nxt.get("href")) if nxt else None
+        # Ayrıştırılamayan "sonraki sayfa" bağlantısında sayfalama burada biter.
+        page_url = _join_link(page_url, nxt.get("href")) if nxt else None
         pages_done += 1
 
     meta = {"pages_scanned": pages_done, "books_dispatched": len(book_urls), "ai_used": use_ai}
