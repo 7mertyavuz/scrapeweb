@@ -11,6 +11,7 @@ dist/
 # --- Sanal ortam ---
 .env
 .env.*
+!.env.example
 .venv/
 venv/
 env/

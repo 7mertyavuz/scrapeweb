@@ -1,81 +1,120 @@
-version: "3.9"
+# ScrapeHub — tam dağıtık mod.
+#
+# Kurulum:  cp .env.example .env   # sonra .env içindeki sırları doldurun
+#           docker compose up --build
+#
+# Güvenli varsayılanlar:
+#   - Tüm portlar yalnız 127.0.0.1'e (bu makineye) yayınlanır; ağdaki başka
+#     makineler Redis/Postgres/browserless/Flower/Jaeger'a ulaşamaz.
+#   - Redis, Postgres, browserless ve Flower parola/token ister; eksikse
+#     `docker compose` açıklayıcı bir hatayla durur.
+#   - API'yi ağa açmak isterseniz .env içinde API_BIND_ADDR=0.0.0.0 yapın
+#     (API, API_KEY ile korunur).
+
+# api / worker / flower için ortak ayarlar
+x-app-env: &app-env
+  REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD ayarlanmamış - .env.example dosyasına bakın}@redis:6379/0
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-scrape}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD ayarlanmamış - .env.example dosyasına bakın}@postgres:5432/${POSTGRES_DB:-scrapehub}
+  JAEGER_ENDPOINT: http://jaeger:4318/v1/traces
+  BROWSERLESS_URL: ws://browserless:3000?token=${BROWSERLESS_TOKEN:?BROWSERLESS_TOKEN ayarlanmamış - .env.example dosyasına bakın}
+  OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+  API_KEY: ${API_KEY:?API_KEY ayarlanmamış - .env.example dosyasına bakın}
+  PUBLIC_READ: ${PUBLIC_READ:-false}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
 
 services:
   redis:
-    image: redis/redis-stack:latest
+    image: redis/redis-stack:7.4.0-v8
+    environment:
+      REDIS_ARGS: --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD ayarlanmamış - .env.example dosyasına bakın}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}   # yalnız sağlık denetimindeki redis-cli için
     ports:
-      - "6379:6379"
-      - "8001:8001"
+      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:8001:8001"   # RedisInsight arayüzü
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: scrape
-      POSTGRES_PASSWORD: scrape
-      POSTGRES_DB: scrapehub
+      POSTGRES_USER: ${POSTGRES_USER:-scrape}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD ayarlanmamış - .env.example dosyasına bakın}
+      POSTGRES_DB: ${POSTGRES_DB:-scrapehub}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # JavaScript render ve WAF bypass için Headless Chrome
   browserless:
-    image: browserless/chrome:latest
-    ports:
-      - "3000:3000"
+    image: browserless/chrome:1.61.1-chrome-stable
     environment:
-      - MAX_CONCURRENT_SESSIONS=10
-
-  # Dağıtık İzleme (Distributed Tracing) Arayüzü
-  jaeger:
-    image: jaegertracing/all-in-one:latest
+      MAX_CONCURRENT_SESSIONS: 10
+      TOKEN: ${BROWSERLESS_TOKEN:?BROWSERLESS_TOKEN ayarlanmamış - .env.example dosyasına bakın}
     ports:
-      - "16686:16686" # Web UI
-      - "4318:4318"   # OTLP HTTP Alıcı
+      - "127.0.0.1:3000:3000"
+
+  # Dağıtık İzleme (Distributed Tracing) Arayüzü — kimlik doğrulaması yok,
+  # bu yüzden yalnız yerel makineye açık.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    ports:
+      - "127.0.0.1:16686:16686" # Web UI
+      - "127.0.0.1:4318:4318"   # OTLP HTTP Alıcı
 
   api:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    environment:
-      PYTHONPATH: /app   # DOSYALARI BULMASI İÇİN EKLENDİ
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+psycopg2://scrape:scrape@postgres:5432/scrapehub
-      JAEGER_ENDPOINT: http://jaeger:4318/v1/traces
-      BROWSERLESS_URL: ws://browserless:3000
-      OLLAMA_URL: http://host.docker.internal:11434  
+    environment: *app-env
     ports:
-      - "8000:8000"
+      - "${API_BIND_ADDR:-127.0.0.1}:8000:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - redis
-      - postgres
-      - jaeger
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
 
   worker:
     build: .
     command: celery -A workers.celery_app.celery_app worker --loglevel=info --concurrency=4
-    environment:
-      PYTHONPATH: /app   # DOSYALARI BULMASI İÇİN EKLENDİ
-      REDIS_URL: redis://redis:6379/0
-      DATABASE_URL: postgresql+psycopg2://scrape:scrape@postgres:5432/scrapehub
-      JAEGER_ENDPOINT: http://jaeger:4318/v1/traces
-      BROWSERLESS_URL: ws://browserless:3000
-      OLLAMA_URL: http://host.docker.internal:11434
+    environment: *app-env
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - redis
-      - postgres
-      - browserless
-      - jaeger
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      browserless:
+        condition: service_started
+      jaeger:
+        condition: service_started
 
   flower:
     build: .
     command: celery -A workers.celery_app.celery_app flower --port=5555
     environment:
-      PYTHONPATH: /app   # DOSYALARI BULMASI İÇİN EKLENDİ
-      REDIS_URL: redis://redis:6379/0
+      # Flower görev modüllerini içe aktarır; bu sırada veritabanına da
+      # bağlandığı için uygulamayla aynı ortamı alır.
+      <<: *app-env
+      FLOWER_BASIC_AUTH: ${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?FLOWER_PASSWORD ayarlanmamış - .env.example dosyasına bakın}
     ports:
-      - "5555:5555"
+      - "127.0.0.1:5555:5555"
     depends_on:
-      - redis
-      - worker
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_started
