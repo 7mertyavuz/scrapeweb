@@ -151,6 +151,58 @@ def test_chord_webhook_fires_when_a_url_fails(eager, monkeypatch, requeued, webh
     assert body["requeued"] == 1
 
 
+# --------------------------------------------------------------------------
+# Webhook istenmişse koşu HER durumda tek bir webhook ile biter
+# (katalogdan URL çıkmasa da, per-URL modunda da).
+# --------------------------------------------------------------------------
+HOOK = "https://hooks.example/done"
+
+
+@pytest.mark.parametrize("chunk_size", [10, 1], ids=["chunked", "per_url"])
+def test_webhook_fires_when_catalog_yields_no_urls(eager, monkeypatch, webhook_sent, chunk_size):
+    """Başlangıç sayfası 404 / ağ hatası / robots engeli: fetcher.get None döner."""
+    monkeypatch.setattr(tasks.fetcher, "get", lambda url: None)
+    res = tasks.discover_catalog.apply(
+        args=[None, 3, chunk_size], kwargs={"webhook_url": HOOK}
+    ).get()
+    assert len(webhook_sent) == 1
+    assert res["pages_scanned"] == 0 and res["books_dispatched"] == 0
+    assert res["webhook_attached"] is True
+    body = webhook_sent[0]["json"]
+    assert webhook_sent[0]["url"] == HOOK
+    assert body["event"] == "scraping_completed"
+    assert (body["total_processed"], body["successful_inserts"], body["requeued"]) == (0, 0, 0)
+    assert body["meta"]["pages_scanned"] == 0
+
+
+def test_no_webhook_when_not_requested_and_no_urls(eager, monkeypatch, webhook_sent):
+    monkeypatch.setattr(tasks.fetcher, "get", lambda url: None)
+    res = tasks.discover_catalog.apply(args=[None, 3, 10]).get()
+    assert res["books_dispatched"] == 0
+    assert webhook_sent == []
+
+
+def test_per_url_mode_fires_one_webhook(eager, webhook_sent):
+    res = tasks.discover_catalog.apply(args=[None, 1, 1], kwargs={"webhook_url": HOOK}).get()
+    assert count_books() == 5
+    assert len(webhook_sent) == 1
+    assert res["mode"] == "per_url"
+    assert res["webhook_attached"] is True
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"]) == (5, 5)
+    assert body["meta"]["books_dispatched"] == 5
+
+
+def test_per_url_mode_webhook_fires_when_a_url_fails(eager, monkeypatch, requeued, webhook_sent):
+    monkeypatch.setattr(tasks.fetcher, "get", _failing_for("2"))
+    tasks.discover_catalog.apply(args=[None, 1, 1], kwargs={"webhook_url": HOOK}).get()
+    assert len(webhook_sent) == 1
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"], body["requeued"]) == (5, 4, 1)
+    failed = "https://books.toscrape.com/catalogue/book-2.html"
+    assert requeued == [((failed,), {"force": False, "use_ai": False})]
+
+
 def test_webhook_callback_flattens_chunk_results(webhook_sent):
     nested = [
         [{"status": "ok"}, {"status": "ok"}],

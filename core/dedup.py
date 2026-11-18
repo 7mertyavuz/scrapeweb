@@ -7,11 +7,19 @@ tekrar çekme.
 
 İki mod:
   1. Redis Stack varsa  -> gerçek RedisBloom (BF.INSERT / BF.EXISTS) - O(1), RAM'de, devasa ölçekli.
-     Bloom filtresinden tek öğe silinemez; bu yüzden ömür FİLTRENİN tamamına verilir:
-     filtre ilk işaretten DEDUP_TTL saniye sonra toptan silinir ve yeniden başlar
-     (URL başına değil, pencere başına süre).
-  2. Redis yoksa        -> in-memory set fallback (tek makinede ders/test için yeterli);
-     burada süre URL başınadır.
+  2. Redis yoksa        -> in-memory fallback (tek makinede ders/test için yeterli).
+
+Ömür (iki modda aynı): Bloom filtresinden tek öğe silinemez, bu yüzden zaman
+SLICES dilime bölünür (dilim genişliği w = ceil(DEDUP_TTL / SLICES) sn). Her dilimin
+kendi filtresi vardır; URL, işaretlendiği andaki dilime yazılır ve o dilim, dilimin
+bitişinden DEDUP_TTL sonra silinir (Redis'te anahtar ömrü). seen() hâlâ yaşayan
+dilimlerin hepsine bakar. Sonuç:
+  - işaretlenen URL en az DEDUP_TTL, en çok DEDUP_TTL + w saniye "görüldü" kalır
+    (varsayılan 24 sa için 24-27 sa);
+  - dilimler tek tek düşer: bir anda yalnız DEDUP_TTL'ini doldurmuş kayıtlar unutulur,
+    tüm durum aynı anda sıfırlanmaz.
+Dilim numarası worker'ın saatinden hesaplanır; süreçler arası tutarlılık için worker
+saatlerinin (NTP ile) senkron olduğu varsayılır.
 
 Bloom filter neden? 500k URL'i bir SQL tablosunda "SELECT ... WHERE url=?" ile
 kontrol etmek pahalı. Bloom filter nanosaniyede "kesinlikle yok" veya "muhtemelen var"
@@ -19,6 +27,7 @@ cevabı verir. False-positive oranı ayarlanabilir (default %0.1).
 """
 from __future__ import annotations
 import hashlib
+import math
 import time
 from typing import Optional
 
@@ -39,14 +48,17 @@ def _key(url: str) -> str:
 class Deduplicator:
     """URL daha önce işlendi mi? sorusunu cevaplar."""
 
+    # Dilim filtrelerinin adı: scrapehub:seen_urls:<w>:<dilim no>. Genişliği (w) ada
+    # katmak, DEDUP_TTL değişince eski numaralandırmayla karışmayı önler.
     BLOOM_NAME = "scrapehub:seen_urls"
+    SLICES = 8   # büyüdükçe ömür üst sınırı TTL'e yaklaşır, seen() daha çok filtreye bakar
 
     CHASH_PREFIX = "scrapehub:chash:"
 
     def __init__(self) -> None:
         self._client: Optional["redis.Redis"] = None
-        self._mem: set[str] = set()        # fallback
-        self._mem_ttl: dict[str, float] = {}
+        self._clock = time.time                       # testlerde elle sürülür
+        self._mem_slices: dict[tuple[int, int], set[str]] = {}   # fallback: (w, dilim) -> anahtarlar
         self._mem_chash: dict[str, str] = {}   # incremental: url-key -> content hash (fallback)
         self.backend = "memory"
 
@@ -56,68 +68,74 @@ class Deduplicator:
                     settings.redis_url, decode_responses=True
                 )
                 self._client.ping()
-                self._ensure_bloom()
                 self.backend = "redis-bloom"
             except Exception:
                 # Redis ayakta değilse sessizce memory moduna düş.
                 self._client = None
 
-    def _ensure_bloom(self) -> None:
-        """RedisBloom filtresini bir kez reserve et (zaten varsa hatayı yut)."""
-        try:
-            self._client.execute_command(
-                "BF.RESERVE",
-                self.BLOOM_NAME,
-                settings.bloom_error_rate,
-                settings.bloom_capacity,
-            )
-        except Exception:
-            pass  # zaten reserve edilmiş
+    # --- Zaman dilimleri ---
+    def _slice_width(self, ttl: int) -> int:
+        return max(1, math.ceil(ttl / self.SLICES))
+
+    def _window(self) -> tuple[int, int, range, float]:
+        """(ttl, w, şu an yaşayan dilim numaraları, şimdi)."""
+        ttl = max(0, int(settings.dedup_ttl_sec))
+        w = self._slice_width(ttl)
+        now = self._clock()
+        # Dilim s, (s+1)*w + ttl anına kadar yaşar.
+        return ttl, w, range(math.floor((now - ttl) / w), math.floor(now / w) + 1), now
+
+    def _slice_name(self, w: int, s: int) -> str:
+        return f"{self.BLOOM_NAME}:{w}:{s}"
 
     def seen(self, url: str) -> bool:
-        """Bu URL daha önce görüldüyse True döner."""
+        """Bu URL son DEDUP_TTL içinde işaretlendiyse True döner."""
         k = _key(url)
+        _, w, alive, _ = self._window()
         if self._client is not None:
             try:
-                return bool(self._client.execute_command("BF.EXISTS", self.BLOOM_NAME, k))
+                pipe = self._client.pipeline(transaction=False)   # tek gidiş-dönüş
+                for s in alive:
+                    pipe.execute_command("BF.EXISTS", self._slice_name(w, s), k)
+                return any(int(r) for r in pipe.execute())
             except Exception:
                 pass
-        # memory fallback (TTL kontrollü)
-        now = time.time()
-        exp = self._mem_ttl.get(k)
-        if exp and exp < now:
-            self._mem.discard(k)
-            self._mem_ttl.pop(k, None)
-            return False
-        return k in self._mem
+        return any(k in self._mem_slices.get((w, s), ()) for s in alive)
 
     def mark(self, url: str) -> None:
-        """URL'i 'görüldü' olarak işaretle."""
+        """URL'i 'görüldü' olarak işaretle (şu anki dilime yazar)."""
         k = _key(url)
+        ttl, w, alive, now = self._window()
+        s = alive[-1]
         if self._client is not None:
             try:
-                # BF.INSERT, filtre yoksa (ör. TTL ile silindiyse) onu ayarlı kapasite ve
-                # hata oranıyla yeniden kurar; BF.ADD varsayılan küçük parametreler kullanırdı.
-                self._client.execute_command(
-                    "BF.INSERT", self.BLOOM_NAME,
-                    "CAPACITY", settings.bloom_capacity,
-                    "ERROR", settings.bloom_error_rate,
+                # Dilim, bitişinden ttl sonra silinir. Göreli süre (PEXPIRE) verilir ki
+                # Redis sunucusunun saatiyle istemcininki arasındaki fark ömrü kaydırmasın.
+                expire_ms = max(1, math.ceil(((s + 1) * w + ttl - now) * 1000))
+                name = self._slice_name(w, s)
+                pipe = self._client.pipeline(transaction=True)    # MULTI/EXEC: ömürsüz filtre kalmasın
+                # BF.INSERT filtreyi yoksa kurar. Toplam bellek ve birleşik yanlış-pozitif
+                # oranı tek filtreye yakın kalsın diye kapasite dilimlere bölünür (aşılırsa
+                # RedisBloom kendini büyütür), hata oranı bakılan dilim sayısına bölünür.
+                pipe.execute_command(
+                    "BF.INSERT", name,
+                    "CAPACITY", math.ceil(settings.bloom_capacity / self.SLICES),
+                    "ERROR", settings.bloom_error_rate / (self.SLICES + 1),
                     "ITEMS", k,
                 )
-                self._ensure_ttl()
+                pipe.pexpire(name, expire_ms)
+                pipe.execute()
                 return
             except Exception:
                 pass
-        self._mem.add(k)
-        self._mem_ttl[k] = time.time() + settings.dedup_ttl_sec
+        # Bellek: aynı dilim düzeni; artık yaşamayan dilimler burada atılır.
+        for old in [key for key in self._mem_slices if key[0] != w or key[1] not in alive]:
+            del self._mem_slices[old]
+        self._mem_slices.setdefault((w, s), set()).add(k)
 
-    def _ensure_ttl(self) -> None:
-        """Filtrenin ömrü yoksa DEDUP_TTL ver; varsa uzatma (pencere ilk işaretten başlar)."""
-        try:
-            if self._client.ttl(self.BLOOM_NAME) == -1:   # -1: anahtar var, ömrü yok
-                self._client.expire(self.BLOOM_NAME, settings.dedup_ttl_sec)
-        except Exception:
-            pass  # ömür verilemese de işaret yazıldı
+    def _mem_entries(self) -> int:
+        """Bellek yedeğinde tutulan kayıt sayısı (test/teşhis için)."""
+        return sum(len(v) for v in self._mem_slices.values())
 
     def check_and_mark(self, url: str) -> bool:
         """

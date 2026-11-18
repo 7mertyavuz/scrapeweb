@@ -54,9 +54,9 @@ def env(monkeypatch):
     monkeypatch.setattr(settings, "proxy_tier_1", "")
     monkeypatch.setattr(settings, "proxy_tier_2", "")
     monkeypatch.setattr(settings, "respect_robots", False)
-    fetcher_mod._robot_parser.cache_clear()
+    fetcher_mod._robots_cache.clear()
     yield sleeps
-    fetcher_mod._robot_parser.cache_clear()
+    fetcher_mod._robots_cache.clear()
 
 
 def _install(monkeypatch, routes: dict) -> FakeNet:
@@ -144,13 +144,83 @@ def test_fetcher_skips_disallowed_url_without_requesting_it(env, monkeypatch):
     assert net.calls == ["https://a.example/robots.txt"]
 
 
-def test_unreachable_robots_does_not_block_forever(env, monkeypatch):
-    """Geçici robots.txt hatası her şeyi kalıcı olarak engellememeli (önbelleğe girmez)."""
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr(fetcher_mod, "_now", c)
+    return c
+
+
+def test_unreachable_robots_does_not_block_forever(env, monkeypatch, clock):
+    """Geçici robots.txt hatası her şeyi kalıcı olarak belirlememeli: süre dolunca yeniden denenir."""
     monkeypatch.setattr(settings, "respect_robots", True)
     robots = "https://d.example/robots.txt"
     _install(monkeypatch, {robots: [curl_requests.RequestsError("zaman aşımı"), _resp(200, ROBOTS_A)]})
     assert allowed_by_robots("https://d.example/private/x") is True     # okunamadı -> izin
+    clock.t += fetcher_mod.ROBOTS_ERROR_TTL
     assert allowed_by_robots("https://d.example/private/x") is False    # sonra okundu -> kural
+
+
+@pytest.mark.parametrize("failure", [
+    _resp(503), _resp(500),
+    curl_requests.RequestsError("zaman aşımı"),
+], ids=["503", "500", "timeout"])
+def test_unreadable_robots_is_not_refetched_before_every_page(env, monkeypatch, clock, failure):
+    """Gözlenen hata: robots 503 iken 5 sayfa -> 5 robots isteği (zaman aşımında her sayfaya +timeout)."""
+    monkeypatch.setattr(settings, "respect_robots", True)
+    robots = "https://e.example/robots.txt"
+    pages = [f"https://e.example/p{i}" for i in range(5)]
+    net = _install(monkeypatch, {robots: failure, **{p: _resp(200, "ok") for p in pages}})
+    for p in pages:
+        assert Fetcher().get(p) == "ok"                  # okunamadı -> izinli sayılır
+        clock.t += 1
+    assert net.calls.count(robots) == 1
+    assert [c for c in net.calls if c != robots] == pages
+
+
+def test_robots_rules_are_refreshed_after_ttl(env, monkeypatch, clock):
+    """Okunan kurallar worker süreci yaşadıkça değil, ROBOTS_TTL boyunca geçerli."""
+    monkeypatch.setattr(settings, "respect_robots", True)
+    robots = "https://f.example/robots.txt"
+    net = _install(monkeypatch, {robots: [_resp(200, ROBOTS_A), _resp(200, "User-agent: *\nDisallow:\n")]})
+    assert allowed_by_robots("https://f.example/private/x") is False
+    clock.t += fetcher_mod.ROBOTS_TTL - 1
+    assert allowed_by_robots("https://f.example/private/x") is False    # hâlâ önbellekte
+    assert net.calls.count(robots) == 1
+    clock.t += 1
+    assert allowed_by_robots("https://f.example/private/x") is True     # yenilendi
+    assert net.calls.count(robots) == 2
+
+
+def test_refresh_failure_keeps_last_known_rules(env, monkeypatch, clock):
+    """Yenileme geçici olarak başarısızsa son okunan kurallar korunur (birden 'her şey serbest' olmaz)."""
+    monkeypatch.setattr(settings, "respect_robots", True)
+    robots = "https://g.example/robots.txt"
+    net = _install(monkeypatch, {robots: [_resp(200, ROBOTS_A), _resp(503), _resp(200, "User-agent: *\nDisallow:\n")]})
+    assert allowed_by_robots("https://g.example/private/x") is False
+    clock.t += fetcher_mod.ROBOTS_TTL
+    assert allowed_by_robots("https://g.example/private/x") is False    # 503: eski kural sürer
+    assert allowed_by_robots("https://g.example/private/y") is False    # ve hemen yeniden istenmez
+    assert net.calls.count(robots) == 2
+    clock.t += fetcher_mod.ROBOTS_ERROR_TTL
+    assert allowed_by_robots("https://g.example/private/x") is True
+    assert net.calls.count(robots) == 3
+
+
+def test_robots_cache_is_bounded(env, monkeypatch, clock):
+    monkeypatch.setattr(settings, "respect_robots", True)
+    _install(monkeypatch, {})
+    for i in range(fetcher_mod.ROBOTS_CACHE_SIZE + 50):
+        allowed_by_robots(f"https://h{i}.example/x")
+    assert len(fetcher_mod._robots_cache) <= fetcher_mod.ROBOTS_CACHE_SIZE
 
 
 def test_robots_unsafe_host_makes_no_request(env, monkeypatch):

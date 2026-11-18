@@ -168,6 +168,8 @@ def discover_catalog(
         page_url = urljoin(page_url, nxt.get("href")) if nxt else None
         pages_done += 1
 
+    meta = {"pages_scanned": pages_done, "books_dispatched": len(book_urls), "ai_used": use_ai}
+
     if chunk_size and chunk_size > 1 and book_urls:
         task_group = group(
             scrape_chunk.s(book_urls[i:i + chunk_size], use_ai)
@@ -176,7 +178,6 @@ def discover_catalog(
 
         # Webhook varsa Celery Chord ile bağla, yoksa normal asenkron çalıştır
         if webhook_url:
-            meta = {"pages_scanned": pages_done, "books_dispatched": len(book_urls), "ai_used": use_ai}
             callback = webhook_callback.s(webhook_url, meta)
             group_result = chord(task_group)(callback)
         else:
@@ -192,11 +193,25 @@ def discover_catalog(
             "group_id": getattr(group_result, "id", None),
         }
 
-    for u in book_urls:
-        scrape_book.delay(u, force=False, use_ai=use_ai)
-    
+    # Webhook istenmişse koşu her durumda tek bir webhook ile biter.
+    if webhook_url and book_urls:
+        # Tek URL'lik chunk'lar: scrape_chunk hata vermez (başarısız URL'yi tekil
+        # scrape_book görevine atar), bu yüzden chord geri çağrısı her durumda çalışır.
+        # Doğrudan scrape_book chord'u, kalıcı başarısız tek URL'de webhook'u düşürürdü.
+        chord(scrape_chunk.s([u], use_ai) for u in book_urls)(
+            webhook_callback.s(webhook_url, meta)
+        )
+    elif webhook_url:
+        # Katalogdan URL çıkmadı (başlangıç sayfası 404 / ağ hatası / robots engeli ya da
+        # boş katalog): kurulacak chord yok, sonucu doğrudan bildir.
+        webhook_callback.delay([], webhook_url, meta)
+    else:
+        for u in book_urls:
+            scrape_book.delay(u, force=False, use_ai=use_ai)
+
     return {
         "pages_scanned": pages_done,
         "books_dispatched": len(book_urls),
         "mode": "per_url",
+        "webhook_attached": bool(webhook_url),
     }

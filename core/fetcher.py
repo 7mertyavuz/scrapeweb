@@ -4,7 +4,6 @@ Katman 3 + 4: Ağ, Stealth Bypass ve Proxy Şelalesi (Waterfall).
 from __future__ import annotations
 import time
 import urllib.robotparser as robotparser
-from functools import lru_cache
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -16,14 +15,25 @@ from core.netguard import UnsafeURLError, guarded_request
 
 logger = get_logger(__name__)
 
-@lru_cache(maxsize=256)
-def _robot_parser(origin: str) -> robotparser.RobotFileParser:
+# robots.txt önbelleği (worker süreci başına, alan adı başına):
+#   - okunan ya da kesin sonuç (200 / 4xx) ROBOTS_TTL boyunca kullanılır, sonra yeniden çekilir;
+#   - okunamayan sonuç (5xx, ağ hatası, zaman aşımı) da ROBOTS_ERROR_TTL boyunca önbellekte
+#     tutulur ki her sayfadan önce yeniden istenip siteye giden yükü katlamasın. Bu sürede
+#     varsa son okunan kurallar, yoksa "izinli" geçerlidir; süre dolunca yeniden denenir.
+ROBOTS_TTL = 60 * 60
+ROBOTS_ERROR_TTL = 5 * 60
+ROBOTS_CACHE_SIZE = 256
+_now = time.monotonic
+# origin -> (geçerlilik sonu, ayrıştırıcı ya da None = okunamadı, izinli say)
+_robots_cache: dict[str, tuple[float, Optional[robotparser.RobotFileParser]]] = {}
+
+
+def _fetch_robots(origin: str) -> robotparser.RobotFileParser:
     """`origin` (scheme://host[:port]) için robots.txt'i çek ve ayrıştır.
 
     İstek, sayfa istekleri gibi netguard üzerinden gider (SSRF koruması).
     Kurallar urllib.robotparser ile aynı: 401/403 -> her şey yasak, diğer 4xx ->
-    her şey serbest. 5xx ya da ağ hatası istisna fırlatır; lru_cache istisnaları
-    önbelleğe almadığından bir sonraki çağrıda yeniden denenir.
+    her şey serbest. 5xx ya da ağ hatası istisna fırlatır.
     """
     resp = guarded_request(
         "GET", origin + "/robots.txt", impersonate="chrome120", timeout=settings.request_timeout
@@ -39,17 +49,37 @@ def _robot_parser(origin: str) -> robotparser.RobotFileParser:
         raise RuntimeError(f"robots.txt alınamadı: HTTP {resp.status_code}")
     return rp
 
+
+def _robot_parser(origin: str) -> Optional[robotparser.RobotFileParser]:
+    """Önbellekli robots.txt; None = okunamadı (izinli sayılır)."""
+    now = _now()
+    cached = _robots_cache.get(origin)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        rp, ttl = _fetch_robots(origin), ROBOTS_TTL
+    except Exception as exc:
+        # Okunamayan robots.txt kazımayı durdurmasın; iç/özel adres ise sayfa isteği
+        # de netguard'da durur. Son okunan kurallar varsa onlar sürer.
+        rp, ttl = (cached[1] if cached else None), ROBOTS_ERROR_TTL
+        logger.warning(
+            "[robots] okunamadı, %d sn %s: %s (%r)", ttl,
+            "son okunan kurallar geçerli" if rp else "izinli sayılıyor", origin, exc,
+        )
+    _robots_cache.pop(origin, None)
+    if len(_robots_cache) >= ROBOTS_CACHE_SIZE:
+        _robots_cache.pop(next(iter(_robots_cache)))   # en eski eklenen
+    _robots_cache[origin] = (now + ttl, rp)
+    return rp
+
+
 def allowed_by_robots(url: str) -> bool:
     """URL'nin KENDİ alan adının robots.txt kurallarına göre izinli mi?"""
     if not settings.respect_robots:
         return True
     parts = urlsplit(url)
-    try:
-        rp = _robot_parser(f"{parts.scheme}://{parts.netloc}".lower())
-    except Exception as exc:
-        # Okunamayan robots.txt kazımayı kalıcı olarak durdurmasın (önbelleğe girmez).
-        # İç/özel adres ise sayfa isteği de netguard'da durur.
-        logger.warning("[robots] okunamadı, izinli sayılıyor: %s (%r)", url, exc)
+    rp = _robot_parser(f"{parts.scheme}://{parts.netloc}".lower())
+    if rp is None:
         return True
     return rp.can_fetch("*", url) # Stealth için wildcard
 
