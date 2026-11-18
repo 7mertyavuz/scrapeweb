@@ -3,48 +3,44 @@ Katman 3.5: Otonom Tarayıcı & CAPTCHA Bypass (Playwright + Browserless)
 Sadece statik HTML değil, JS Render eden veya WAF (Cloudflare/Datadome)
 atan siteleri gerçek tarayıcı ile geçer.
 
-SSRF koruması (bkz. core/netguard.py):
-  * Hedef URL tarayıcıya verilmeden önce doğrulanır (şema + DNS + IP sınıfı).
-  * Tarayıcı ağa KENDİSİ çıkmaz. Sayfanın her HTTP(S) isteği (ana gezinme,
-    alt kaynaklar, fetch/XHR) ``context.route`` ile yakalanır, worker tarafında
-    ``netguard.guarded_request`` ile yapılır (her yönlendirme adımı denetlenir,
-    doğrulanan IP curl'e sabitlenir: DNS rebinding yok) ve yanıt tarayıcıya
-    ``route.fulfill`` ile verilir.
-  * Route'a uğramayan her şey (Playwright'ın kendiliğinden sürdürdüğü
-    yönlendirme adımları, WebSocket, worker/tarayıcı kaynaklı istekler) bağlama
-    özel, hiçbir yere çıkmayan bir proxy'ye gider ve başarısız olur
-    (``<-loopback>``: loopback adresleri de proxy dışında bırakılmaz).
-    Sonuç: tarayıcı yolunda WebSocket bağlantısı kurulamaz.
-  * Ana gezinmedeki yönlendirme tarayıcıya verilmez; denetlenip yeni bir
-    gezinme olarak açılır (sayfanın adresi ve göreli bağlantıları doğru kalır).
-  * Service worker'lar kapatılır; resim/medya/yazı tipi istekleri hiç yapılmaz
-    (kazımaya katkıları yok, her biri ayrı bir dış istek olurdu).
-"""
-from urllib.parse import urljoin, urlsplit
+SSRF koruması iki katmanlıdır:
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
+* Ağ katmanı (asıl koruma; ``BROWSER_EGRESS_PROXY`` ayarlıyken, compose varsayılanı):
+  browserless'ın internete doğrudan yolu yoktur (``internal`` ağ). Tarayıcı bağlamı tüm
+  trafiğini ``core/egress_proxy.py``'ye yollar; proxy her bağlantının hedefini netguard ile
+  denetler ve denetlenen IP'ye bağlanır. Ana gezinme, yönlendirmeler, alt kaynaklar,
+  fetch/XHR, WebSocket, worker'lar: hepsi tarayıcının kendi ağ yığınıyla, ama bu tek
+  denetimli kapıdan geçer. ``<-loopback>``: Chrome'un loopback adreslerini proxy dışında
+  bırakma varsayılanını kaldırır (sayfa browserless'ın kendi portlarına ulaşamasın).
+* Uygulama katmanı (ek savunma; proxy yoksa TEK koruma): hedef URL tarayıcıya verilmeden
+  önce denetlenir; proxy ayarlı değilse tarayıcının her HTTP(S) isteğinin URL'si
+  ``context.route`` ile denetlenir ve gezinmenin yönlendirme zinciri sonradan kontrol edilir.
+  Bu süzgeç yönlendirme adımlarını, açılır pencereleri, tarayıcının kendi DNS çözümlemesini
+  (rebinding), WebSocket ve WebRTC'yi denetleyemez; bu yüzden yalnız yedektir.
+
+Service worker'lar kapatılır (isteklerini sayfadan bağımsız yaparlar).
+
+Süre: tüm oturumun kesin bir üst sınırı vardır (``REQUEST_TIMEOUT`` x
+``_DEADLINE_FACTOR``). Ana iş parçacığını kilitleyen bir sayfada ``page.content()``
+gibi çağrılar kendi zaman aşımı olmadan asılı kalır; bu yüzden async API ile
+çalışılır ve süre dolunca oturum iptal edilip bağlam kapatılır.
+"""
+import asyncio
+from urllib.parse import urlsplit
+
+from playwright.async_api import async_playwright
 from core.config import settings
 from core.logging import get_logger
-from core.netguard import DEFAULT_MAX_REDIRECTS, HostResolutionError, UnsafeURLError, check_url, guarded_request
+from core.netguard import HostResolutionError, UnsafeURLError, check_url
 
 logger = get_logger(__name__)
 
 # Tarayıcının kendi içinde ürettiği, ağa çıkmayan şemalar.
 _LOCAL_SCHEMES = frozenset({"data", "blob", "about"})
-_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
-# Tarayıcının doğrudan çıkışını kapatan proxy: hiçbir şey dinlemiyor, bağlantı reddedilir.
-_BLACKHOLE_PROXY = {"server": "http://127.0.0.1:9", "bypass": "<-loopback>"}
-_SKIPPED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
-# curl'ün kendisinin yönettiği ya da tarayıcı önbelleğine bağlı istek başlıkları.
-_DROP_REQUEST_HEADERS = frozenset({
-    "host", "content-length", "connection", "keep-alive", "proxy-authorization",
-    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "accept-encoding",
-    "cookie", "if-none-match", "if-modified-since", "if-match", "if-unmodified-since",
-    "if-range", "range",
-})
-# curl yanıtı zaten açıp tam gövdeyi verdiği için geçersizleşen yanıt başlıkları.
-_DROP_RESPONSE_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"})
+# Bağlanma + gezinme (REQUEST_TIMEOUT) + içerik okuma + WAF beklemesi için toplam pay.
+_DEADLINE_FACTOR = 1.5
+_CLOSE_TIMEOUT = 5.0
+_warned_without_proxy = False
 
 
 def is_browser_request_allowed(url: str) -> bool:
@@ -62,79 +58,24 @@ def is_browser_request_allowed(url: str) -> bool:
         return False
 
 
-def _response_headers(resp) -> dict:
-    headers: dict = {}
-    for name, value in resp.headers.multi_items():
-        key = name.lower()
-        if key in _DROP_RESPONSE_HEADERS or value is None:
-            continue
-        sep = "\n" if key == "set-cookie" else ", "
-        headers[key] = headers[key] + sep + value if key in headers else value
-    return headers
+async def _guard_route(route) -> None:
+    """Proxy'siz kurulumda yedek süzgeç: iç/özel adrese giden isteği iptal et."""
+    if await asyncio.to_thread(is_browser_request_allowed, route.request.url):
+        await route.continue_()
+    else:
+        await route.abort("blockedbyclient")
 
 
-class _GuardedEgress:
-    """``context.route`` işleyicisi: tarayıcının isteklerini netguard üzerinden yapar."""
-
-    def __init__(self, context, page):
-        self.context = context
-        self.page = page
-        self.redirect_to = None  # ana gezinmenin denetlenecek yönlendirme hedefi
-
-    def __call__(self, route) -> None:
-        try:
-            self._handle(route)
-        except Exception as exc:  # işleyici asla istek sürdürmeden düşmemeli
-            logger.warning("[ssrf] tarayıcı isteği yapılamadı: %s (%r)", route.request.url, exc)
-            try:
-                route.abort("failed")
-            except Exception:
-                pass
-
-    def _handle(self, route) -> None:
-        req = route.request
-        if urlsplit(req.url).scheme.lower() in _LOCAL_SCHEMES:
-            route.continue_()  # ağa çıkmaz
-            return
-        if req.resource_type in _SKIPPED_RESOURCE_TYPES:
-            route.abort("blockedbyclient")
-            return
-        main_nav = req.is_navigation_request() and req.frame == self.page.main_frame
-
-        headers = {k: v for k, v in req.headers.items() if k.lower() not in _DROP_REQUEST_HEADERS and not k.startswith(":")}
-        cookies = self.context.cookies(req.url)
-        if cookies:
-            headers["cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-        try:
-            resp = guarded_request(
-                req.method,
-                req.url,
-                # Ana gezinmenin yönlendirmesi tarayıcıda yeni gezinme olarak açılır;
-                # alt kaynaklarınki burada, her adım denetlenerek izlenir.
-                max_redirects=0 if main_nav else DEFAULT_MAX_REDIRECTS,
-                headers=headers,
-                data=req.post_data_buffer,
-                timeout=settings.request_timeout,
-                # TLS/HTTP2 parmak izi Chrome gibi kalsın; başlıklar tarayıcınınkiler.
-                impersonate="chrome120",
-                default_headers=False,
-            )
-        except (UnsafeURLError, HostResolutionError) as exc:
-            logger.warning("[ssrf] tarayıcı isteği engellendi: %s (%s)", req.url, exc)
-            route.abort("blockedbyclient")
-            return
-
-        location = resp.headers.get("location") if resp.status_code in _REDIRECT_CODES else None
-        if main_nav and location:
-            self.redirect_to = urljoin(req.url, location)
-            route.abort("aborted")
-            return
-        route.fulfill(status=resp.status_code, headers=_response_headers(resp), body=resp.content)
+def _context_options() -> dict:
+    options = {"user_agent": settings.user_agent, "service_workers": "block"}
+    if settings.browser_egress_proxy:
+        options["proxy"] = {"server": settings.browser_egress_proxy, "bypass": "<-loopback>"}
+    return options
 
 
-def _navigation_is_safe(response, page) -> bool:
+def _navigation_is_safe(response, page_url: str) -> bool:
     """Yönlendirme zincirindeki her adım ve son URL politikaya uyuyor mu (ek savunma)."""
-    urls = [page.url]
+    urls = [page_url]
     req = getattr(response, "request", None) if response is not None else None
     while req is not None:
         urls.append(req.url)
@@ -142,74 +83,71 @@ def _navigation_is_safe(response, page) -> bool:
     return all(is_browser_request_allowed(u) for u in urls)
 
 
-def _goto(page, egress: _GuardedEgress, url: str):
-    """Gezin; sunucu yönlendirirse hedefi denetleyip yeni gezinme olarak izle."""
-    target = url
-    for _ in range(DEFAULT_MAX_REDIRECTS + 1):
-        egress.redirect_to = None
+async def _scrape(browser, url: str) -> str | None:
+    context = await browser.new_context(**_context_options())
+    if not settings.browser_egress_proxy:
+        await context.route("**/*", _guard_route)
+    page = await context.new_page()
+
+    # networkidle: Sayfadaki tüm ağ/JS işlemleri bitene kadar bekle (SPA'lar için kritik)
+    response = await page.goto(url, wait_until="networkidle", timeout=settings.request_timeout * 1000)
+    if not await asyncio.to_thread(_navigation_is_safe, response, page.url):
+        logger.warning("[ssrf] tarayıcı iç/özel adrese yönlendirildi, içerik atıldı: %s", url)
+        return None
+
+    content = await page.content()
+
+    # --- KONU 2: Cookie Harvesting / WAF Çözümü Simülasyonu ---
+    if "datadome" in content.lower() or "cf-browser-verification" in content.lower():
+        logger.warning(f"WAF Koruması Tespit Edildi ({url})! CapSolver simülasyonu başlatılıyor...")
+
+        # Gerçekte burada 2Captcha/CapSolver API'ye sitekey gönderilir.
+        # Çözülen token cookie'ye basılır:
+        await page.wait_for_timeout(3000) # İnsan simülasyonu / Çözüm süresi
+        # await page.evaluate("document.cookie = 'datadome=SOLVED_TOKEN_HERE';")
+        # await page.reload()
+        if not await asyncio.to_thread(is_browser_request_allowed, page.url):
+            return None
+        logger.info("WAF Bypass tamamlandı.")
+        content = await page.content()
+
+    return content
+
+
+async def _fetch(url: str) -> str | None:
+    async with async_playwright() as p:
+        # Docker'daki browserless servisine WebSocket ile bağlan
+        logger.info("Browserless CDP'ye bağlanılıyor...")
+        browser = await p.chromium.connect_over_cdp(
+            settings.browserless_url, timeout=settings.request_timeout * 1000
+        )
         try:
-            # networkidle: Sayfadaki tüm ağ/JS işlemleri bitene kadar bekle (SPA'lar için kritik)
-            response = page.goto(target, wait_until="networkidle", timeout=settings.request_timeout * 1000)
-        except PlaywrightError:
-            if egress.redirect_to is None:
-                raise
-            response = None
-        if egress.redirect_to is None:
-            return response
-        target = egress.redirect_to
-        check_url(target, resolve=False)  # http(s) dışı / sözdizimi bozuk hedefe gezinme yok
-        logger.debug("[ssrf] tarayıcı yönlendirmesi denetlenerek izleniyor -> %s", target)
-    raise UnsafeURLError(f"yönlendirme sınırı aşıldı ({DEFAULT_MAX_REDIRECTS}): {url}")
+            return await asyncio.wait_for(_scrape(browser, url), settings.request_timeout * _DEADLINE_FACTOR)
+        except asyncio.TimeoutError:
+            logger.error("Otonom Tarayıcı süre sınırını aştı, oturum kapatıldı: %s", url)
+            return None
+        finally:
+            try:
+                await asyncio.wait_for(browser.close(), _CLOSE_TIMEOUT)
+            except Exception:
+                pass
 
 
 def fetch_with_browser(url: str) -> str | None:
+    global _warned_without_proxy
     try:
         check_url(url, resolve=True)
     except (UnsafeURLError, HostResolutionError) as exc:
         logger.warning("[ssrf] tarayıcı hedefi engellendi: %s (%s)", url, exc)
         return None
-
+    if not settings.browser_egress_proxy and not _warned_without_proxy:
+        _warned_without_proxy = True
+        logger.warning(
+            "[ssrf] BROWSER_EGRESS_PROXY ayarlı değil: tarayıcı yolunda yalnız URL süzgeci var; "
+            "yönlendirme adımları, açılır pencereler, DNS rebinding, WebSocket ve WebRTC denetlenemez (bkz. README)."
+        )
     try:
-        with sync_playwright() as p:
-            # Docker'daki browserless servisine WebSocket ile bağlan
-            logger.info("Browserless CDP'ye bağlanılıyor...")
-            browser = p.chromium.connect_over_cdp(settings.browserless_url)
-            try:
-                context = browser.new_context(
-                    user_agent=settings.user_agent, service_workers="block", proxy=_BLACKHOLE_PROXY,
-                )
-                page = context.new_page()
-                egress = _GuardedEgress(context, page)
-                context.route("**/*", egress)
-
-                try:
-                    response = _goto(page, egress, url)
-                except UnsafeURLError as exc:
-                    logger.warning("[ssrf] tarayıcı gezinmesi engellendi: %s (%s)", url, exc)
-                    return None
-                if not _navigation_is_safe(response, page):
-                    logger.warning("[ssrf] tarayıcı iç/özel adrese yönlendirildi, içerik atıldı: %s", url)
-                    return None
-
-                content = page.content()
-
-                # --- KONU 2: Cookie Harvesting / WAF Çözümü Simülasyonu ---
-                if "datadome" in content.lower() or "cf-browser-verification" in content.lower():
-                    logger.warning(f"WAF Koruması Tespit Edildi ({url})! CapSolver simülasyonu başlatılıyor...")
-
-                    # Gerçekte burada 2Captcha/CapSolver API'ye sitekey gönderilir.
-                    # Çözülen token cookie'ye basılır:
-                    page.wait_for_timeout(3000) # İnsan simülasyonu / Çözüm süresi
-                    # page.evaluate("document.cookie = 'datadome=SOLVED_TOKEN_HERE';")
-                    # page.reload()
-                    if not is_browser_request_allowed(page.url):
-                        return None
-                    logger.info("WAF Bypass tamamlandı.")
-                    content = page.content()
-
-                return content
-            finally:
-                browser.close()
+        return asyncio.run(_fetch(url))
     except Exception as e:
         logger.error(f"Otonom Tarayıcı hatası ({url}): {e}")
         return None

@@ -235,3 +235,35 @@ def test_robots_unsafe_host_makes_no_request(env, monkeypatch):
     monkeypatch.setattr(fetcher_mod, "guarded_request", guarded)
     assert Fetcher().get("http://10.0.0.5/x") is None
     assert all(u.startswith("http://10.0.0.5") for u in sent)
+
+
+# --------------------------------------------------------------------------
+# Ayrıştırılamayan yönlendirme hedefi (ör. ``Location: https://[cdn]/x``)
+# --------------------------------------------------------------------------
+def _redirecting_netguard(monkeypatch, location: str) -> list[str]:
+    """Gerçek netguard.guarded_request; ağ yerine hep ``location``'a 302 dönen sahte curl."""
+    import functools
+
+    import core.netguard as netguard
+
+    sent: list[str] = []
+
+    def send(method, url, **kwargs):
+        sent.append(url)
+        return types.SimpleNamespace(
+            status_code=302, headers={"location": location}, primary_ip="93.184.216.34", text="",
+        )
+
+    monkeypatch.setattr(netguard, "_resolve", lambda host, port: ["93.184.216.34"])
+    monkeypatch.setattr(
+        fetcher_mod, "guarded_request", functools.partial(netguard.guarded_request, request_func=send)
+    )
+    return sent
+
+
+def test_unparseable_redirect_location_is_permanent_failure(env, monkeypatch):
+    """Bozuk Location istisna olarak dışarı sızmaz; o URL için kalıcı hata (yeniden deneme yok)."""
+    sent = _redirecting_netguard(monkeypatch, "https://[cdn]/x")
+    assert Fetcher().get("https://shop.example/p") is None
+    assert sent == ["https://shop.example/p"]
+    assert _backoffs(env) == []

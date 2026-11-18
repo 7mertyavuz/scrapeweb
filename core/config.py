@@ -71,6 +71,9 @@ class Settings:
 
     # --- YENİ EKLENENLER (Konu 1, 2, 3, 5) ---
     browserless_url: str = os.getenv("BROWSERLESS_URL", "ws://localhost:3000")
+    # Tarayıcının tüm trafiğini yolladığı SSRF denetimli çıkış proxy'si (core/egress_proxy.py),
+    # TARAYICININ gördüğü adresle; compose'da http://egress:8899. Boşsa yalnız URL süzgeci çalışır.
+    browser_egress_proxy: str = field(default_factory=lambda: os.getenv("BROWSER_EGRESS_PROXY", "").strip())
     capsolver_key: str = os.getenv("CAPSOLVER_KEY", "") # Opsiyonel
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
     jaeger_endpoint: str = os.getenv("JAEGER_ENDPOINT", "http://localhost:4318/v1/traces")

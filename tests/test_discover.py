@@ -252,3 +252,73 @@ def test_webhook_callback_accepts_flat_results(webhook_sent):
     tasks.webhook_callback.run([{"status": "ok"}, {"status": "parse_failed"}], "https://h.example/", {})
     body = webhook_sent[0]["json"]
     assert (body["total_processed"], body["successful_inserts"]) == (2, 1)
+
+
+# --------------------------------------------------------------------------
+# "Sonraki sayfa" bağlantısı bir yere götürmüyorsa (href yok/boş/aynı sayfa)
+# sayfalama orada biter; aynı sayfa yeniden çekilip kitaplar tekrar eklenmez.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("next_link", [
+    '<a>next</a>', '<a href="">next</a>', '<a href="#">next</a>', '<a href="page-1.html">next</a>',
+], ids=["no_href", "empty", "fragment", "self"])
+def test_next_link_to_nowhere_ends_pagination(eager, monkeypatch, next_link):
+    catalog = CATALOG.replace("</body>", f'<ul class="pager"><li class="next">{next_link}</li></ul></body>')
+    fetched: list[str] = []
+
+    def get(url):
+        fetched.append(url)
+        return catalog if "page-" in url else _fake_get(url)
+
+    monkeypatch.setattr(tasks.fetcher, "get", get)
+    res = tasks.discover_catalog.apply(args=[None, 5, 1]).get()   # per_url: sonuçta pages_scanned var
+    assert res["pages_scanned"] == 1
+    assert res["books_dispatched"] == 5
+    assert [u for u in fetched if "page-" in u] == ["https://books.toscrape.com/catalogue/page-1.html"]
+
+
+def test_next_page_cycle_is_not_refetched(eager, monkeypatch):
+    """page-1 -> page-2 -> page-1 döngüsünde her sayfa bir kez çekilir."""
+    pages = {
+        "https://books.toscrape.com/catalogue/page-1.html": "page-2.html",
+        "https://books.toscrape.com/catalogue/page-2.html": "page-1.html",
+    }
+    fetched: list[str] = []
+
+    def get(url):
+        fetched.append(url)
+        if url in pages:
+            return CATALOG.replace(
+                "</body>", f'<ul class="pager"><li class="next"><a href="{pages[url]}">n</a></li></ul></body>'
+            )
+        return _fake_get(url)
+
+    monkeypatch.setattr(tasks.fetcher, "get", get)
+    res = tasks.discover_catalog.apply(args=[None, 5, 1]).get()   # per_url: sonuçta pages_scanned var
+    assert res["pages_scanned"] == 2
+    assert [u for u in fetched if "page-" in u] == list(pages)
+
+
+def test_catalog_redirect_to_unparseable_location_does_not_fail_run(eager, monkeypatch, webhook_sent):
+    """Gerçek fetcher + netguard: katalog sayfası ``Location: https://[cdn]/x`` döndürürse
+    görev düşmez, o sayfa çekilemedi sayılır ve webhook yine gider."""
+    import functools
+    import types
+
+    import core.fetcher as fetcher_mod
+    import core.netguard as netguard
+    from core.fetcher import Fetcher
+
+    def send(method, url, **kwargs):
+        return types.SimpleNamespace(
+            status_code=302, headers={"location": "https://[cdn]/x"}, primary_ip="93.184.216.34", text="",
+        )
+
+    monkeypatch.setattr(tasks.fetcher, "get", types.MethodType(Fetcher.get, tasks.fetcher))
+    monkeypatch.setattr(netguard, "_resolve", lambda host, port: ["93.184.216.34"])
+    monkeypatch.setattr(fetcher_mod, "guarded_request", functools.partial(netguard.guarded_request, request_func=send))
+    for name, value in (("respect_robots", False), ("max_retries", 1), ("request_delay_sec", 0.0), ("domain_delays", {})):
+        monkeypatch.setattr(tasks.settings, name, value)
+
+    res = tasks.discover_catalog.apply(args=[None, 3, 10], kwargs={"webhook_url": HOOK}).get()
+    assert res["pages_scanned"] == 0 and res["books_dispatched"] == 0
+    assert len(webhook_sent) == 1

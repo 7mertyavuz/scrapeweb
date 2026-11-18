@@ -117,6 +117,7 @@ Key environment variables (see `core/config.py` for the full list):
 | `INCREMENTAL` | `false` | Only re-process when content changes |
 | `DEDUP_TTL` | `86400` | Seconds a stored URL stays "seen" (Redis and in-memory) |
 | `BROWSERLESS_URL` | `ws://localhost:3000` | Headless Chrome for AI mode |
+| `BROWSER_EGRESS_PROXY` | (empty; compose: `http://egress:8899`) | SSRF-checked proxy the browser sends all its traffic through, as seen from browserless; empty = in-app URL filter only |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Local LLM endpoint |
 | `JAEGER_ENDPOINT` | `http://localhost:4318/v1/traces` | OpenTelemetry traces |
 
@@ -167,7 +168,8 @@ pytest -q
 | `redis` | Broker + Bloom filter + dead-letter | `6379`, `8001` |
 | `postgres` | Persistent relational storage | `5432` |
 | `flower` | Celery monitoring UI | `5555` |
-| `browserless` | Headless Chrome for dynamic/AI mode | `3000` |
+| `browserless` | Headless Chrome for dynamic/AI mode | `3000` (published by `egress`) |
+| `egress` | The browser's only way out: SSRF-checked proxy (`core/egress_proxy.py`) | — |
 | `jaeger` | Distributed tracing UI | `16686` |
 
 All ports are published on `127.0.0.1` only. To expose the API on your network, set `API_BIND_ADDR=0.0.0.0` in `.env`.
@@ -176,20 +178,19 @@ All ports are published on `127.0.0.1` only. To expose the API on your network, 
 
 - **API key:** `API_KEY` has no default. Write endpoints and, unless `PUBLIC_READ=true`, the data-reading endpoints require `X-API-Key`; `/`, `/static/*`, `/health` and `/metrics` stay open.
 - **Targets:** scrape targets and `webhook_url` must be public `http`/`https` addresses; loopback, private, link-local (cloud metadata) and similar addresses are refused. Hostnames are resolved and checked before connecting, the checked IP is pinned (curl gets the URL rebuilt with the checked hostname, so spellings such as a trailing dot cannot bypass the pin), and each redirect is re-checked (webhooks do not follow redirects). `ALLOW_PRIVATE_NETWORKS=true` turns the address checks off for local development.
-- **Browser/AI mode:** the browser does not reach the network itself. Every HTTP(S) request of the page is made by the worker with the same checks and handed to the browser; WebSocket and other direct connections are blocked. This path is slower and does not load images, media or fonts.
+- **Browser/AI mode:** in the compose setup browserless has no route to the internet, the host or the other services. Its only way out is the `egress` proxy: every connection the browser makes (page, redirects, subresources, fetch/XHR, WebSocket) goes through it, and each target gets the same check as scrape targets and is connected to by the checked IP. A browser session is cut off after 1.5 × `REQUEST_TIMEOUT`.
 - **CORS** is off unless `CORS_ORIGINS` lists origins.
-- **Docker defaults:** ports bound to `127.0.0.1`; Redis, Postgres, browserless and Flower require the passwords/token from `.env`; the image runs as a non-root user. browserless runs on a separate `browser` network and cannot reach Redis, Postgres, Jaeger or Flower by name.
+- **Docker defaults:** ports bound to `127.0.0.1`; Redis, Postgres, browserless and Flower require the passwords/token from `.env`; the image runs as a non-root user. browserless runs on an `internal` `browser` network shared only with the worker and `egress`; it cannot reach Redis, Postgres, Jaeger, Flower or the host.
 - **Dashboard:** server data is rendered as text, never as HTML.
 
 Known limitations:
 
-- If you run browserless outside the provided compose file, pass `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]`; without it a page can send UDP packets to internal addresses via WebRTC.
-- In the browser/AI mode, DNS rebinding is ruled out by design (requests are made by the worker with the checked IP pinned), but this has not been tested against a real rebinding DNS server.
+- Outside the provided compose file (`BROWSER_EGRESS_PROXY` empty) the browser path only has an in-app URL filter: it checks the URL of each HTTP(S) request and the navigation's redirect chain, but not redirect hops (in tests these reached an internal listener as blind requests; their content was not returned), popups, the browser's own DNS lookups (rebinding), WebSocket or WebRTC. For full protection, put browserless where its only way out is `python -m core.egress_proxy` (as the compose file does) and set `BROWSER_EGRESS_PROXY`.
+- WebRTC UDP does not go through the proxy. The compose file turns it off with `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]`; without that flag a page can still send UDP packets to the other containers on the `browser` network (worker, `egress`). Pass the same flag if you run browserless yourself.
+- DNS rebinding in the browser path: the proxy resolves each name once and connects to the checked IP; this was tested with split DNS, not against a real rebinding DNS server.
 - When a proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) is used, IP pinning and the connected-IP check are not applied.
 - There is no rate limiting.
 - `/docs` (OpenAPI UI) is public.
-- WebSocket does not work in the browser/AI mode.
-- In Docker, browserless can still reach ports published on the host, by IP and via `host.docker.internal`.
 
 **Upgrading:** older versions documented a fixed default API key. It is now always rejected; if you deployed with it, set a new random `API_KEY`. Older versions also kept deduplication in a single `scrapehub:seen_urls` key that never expires; the new code ignores it, and you can delete it with `docker compose exec redis redis-cli DEL scrapehub:seen_urls`.
 

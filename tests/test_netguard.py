@@ -7,6 +7,7 @@ için yamalanır). Böylece "dış adres -> 302 -> iç adres" zinciri yerelde ku
 """
 from __future__ import annotations
 
+import asyncio
 import socketserver
 import threading
 import types
@@ -105,6 +106,7 @@ def _fast_fetcher(monkeypatch):
     monkeypatch.setattr(settings, "request_timeout", 5.0)
     monkeypatch.setattr(settings, "proxy_tier_1", "")
     monkeypatch.setattr(settings, "proxy_tier_2", "")
+    monkeypatch.setattr(settings, "browser_egress_proxy", "")
 
 
 # --------------------------------------------------------------------------
@@ -129,11 +131,39 @@ def test_public_ips_accepted(ip):
     "file:///etc/passwd", "gopher://example.com/", "ftp://example.com/", "dict://example.com/",
     "ws://example.com/", "javascript:alert(1)", "data:text/html,x", "http:///nohost",
     "http://u:p@example.com/", "http://example.com\\@127.0.0.1/", "http://exa mple.com/",
-    "http://example.com:99999/",
+    "http://example.com:99999/", "http://example.com:0/", "https://[cdn]/x", "http://[::1/",
 ])
 def test_syntax_and_scheme_rejected(url):
     with pytest.raises(netguard.UnsafeURLError):
         netguard.check_url(url, resolve=False)
+
+
+@pytest.mark.parametrize("url, port", [
+    ("http://example.com/", 80), ("http://example.com:80/", 80), ("https://example.com:8443/x", 8443),
+    ("http://93.184.216.34:81/", 81),
+])
+def test_checked_port_is_the_port_curl_connects_to(url, port):
+    """Denetlenen/sabitlenen port ile curl'e giden URL'deki port aynı olmalı."""
+    from urllib.parse import urlsplit
+
+    t = netguard.check_url(url, resolve=False)
+    assert t.port == port
+    assert (urlsplit(t.request_url).port or (443 if t.request_url.startswith("https") else 80)) == port
+
+
+def test_unparseable_redirect_location_is_policy_error(monkeypatch):
+    """Ayrıştırılamayan Location (ör. https://[cdn]/x) çıplak ValueError değil UnsafeURLError'dır."""
+    monkeypatch.setattr(netguard, "_resolve", lambda host, port: ["93.184.216.34"])
+    sent = []
+
+    def fake_send(method, url, **kwargs):
+        sent.append(url)
+        return types.SimpleNamespace(status_code=302, headers={"location": "https://[cdn]/x"},
+                                     primary_ip="93.184.216.34", text="")
+
+    with pytest.raises(netguard.UnsafeURLError):
+        netguard.guarded_request("GET", "https://example.com/", request_func=fake_send)
+    assert sent == ["https://example.com/"]
 
 
 def test_hostname_resolving_to_private_rejected(monkeypatch):
@@ -323,7 +353,7 @@ def test_webhook_escape_hatch(internal, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Tarayıcı (AI) yolu - Playwright sahte nesnelerle
+# Tarayıcı (AI) yolu - Playwright (async API) sahte nesnelerle
 # --------------------------------------------------------------------------
 class _Req:
     def __init__(self, url, prev=None):
@@ -331,7 +361,9 @@ class _Req:
 
 
 class _FakePlaywright:
-    def __init__(self, final_url, chain):
+    """``async_playwright`` yerine: çağrıları, bağlam ayarlarını ve route'ları kaydeder."""
+
+    def __init__(self, final_url, chain, content_delay=0.0):
         self.calls = []
         self.context_kwargs = {}
         self.routes = []
@@ -340,50 +372,59 @@ class _FakePlaywright:
         class Page:
             url = final_url
 
-            def goto(self, url, **kw):
+            async def goto(self, url, **kw):
                 outer.calls.append(("goto", url))
                 prev = None
                 for u in chain:
                     prev = _Req(u, prev)
                 return types.SimpleNamespace(request=prev)
 
-            def content(self):
+            async def content(self):
+                await asyncio.sleep(content_delay)  # ana iş parçacığı kilitli sayfa benzetimi
                 return "<html>tarayici-icerik</html>"
 
-            def wait_for_timeout(self, ms):
+            async def wait_for_timeout(self, ms):
                 pass
 
         class Context:
-            def route(self, pattern, handler):
+            async def route(self, pattern, handler):
                 outer.routes.append(handler)
 
-            def new_page(self):
+            async def new_page(self):
                 return Page()
 
         class Browser:
-            def new_context(self, **kw):
+            async def new_context(self, **kw):
                 outer.context_kwargs = kw
                 return Context()
 
-            def close(self):
+            async def close(self):
                 outer.calls.append(("close",))
 
-        self.chromium = types.SimpleNamespace(connect_over_cdp=lambda url: Browser())
+        async def connect_over_cdp(url, **kw):
+            return Browser()
+
+        self.chromium = types.SimpleNamespace(connect_over_cdp=connect_over_cdp)
 
     def __call__(self):
         self.calls.append(("start",))
         return self
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *a):
+    async def __aexit__(self, *a):
         return False
+
+
+@pytest.fixture
+def no_egress_proxy(monkeypatch):
+    monkeypatch.setattr(settings, "browser_egress_proxy", "")
 
 
 def test_browser_refuses_internal_target_before_connecting(monkeypatch):
     fake = _FakePlaywright("http://127.0.0.1/", ["http://127.0.0.1/"])
-    monkeypatch.setattr(browser_mod, "sync_playwright", fake)
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
     assert browser_mod.fetch_with_browser("http://127.0.0.1:8000/books") is None
     assert fake.calls == [], "iç adres tarayıcıya hiç verilmemeli"
 
@@ -391,7 +432,7 @@ def test_browser_refuses_internal_target_before_connecting(monkeypatch):
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "http://169.254.169.254/latest/meta-data/"])
 def test_browser_refuses_unsafe_schemes_and_metadata(monkeypatch, url):
     fake = _FakePlaywright(url, [url])
-    monkeypatch.setattr(browser_mod, "sync_playwright", fake)
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
     assert browser_mod.fetch_with_browser(url) is None
     assert fake.calls == []
 
@@ -399,116 +440,72 @@ def test_browser_refuses_unsafe_schemes_and_metadata(monkeypatch, url):
 def test_browser_discards_content_after_redirect_to_internal(public, monkeypatch):
     start = public.url("/page")
     fake = _FakePlaywright("http://10.0.0.5/admin", [start, "http://10.0.0.5/admin"])
-    monkeypatch.setattr(browser_mod, "sync_playwright", fake)
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
     assert browser_mod.fetch_with_browser(start) is None
     assert ("close",) in fake.calls
 
 
-def test_browser_installs_request_guard_and_returns_safe_content(public, monkeypatch):
+def test_browser_sends_all_traffic_through_egress_proxy(public, monkeypatch):
+    """Proxy ayarlıyken tarayıcı bağlamı tüm trafiğini denetimli çıkıştan geçirir (loopback dahil)."""
+    monkeypatch.setattr(settings, "browser_egress_proxy", "http://egress:8899")
     start = public.url("/page")
     fake = _FakePlaywright(start, [start])
-    monkeypatch.setattr(browser_mod, "sync_playwright", fake)
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
     assert browser_mod.fetch_with_browser(start) == "<html>tarayici-icerik</html>"
     assert fake.context_kwargs.get("service_workers") == "block"
-    # Tarayıcının doğrudan çıkışı kapalı: route'a uğramayan her şey ölü proxy'ye gider,
-    # loopback de proxy dışında bırakılmaz.
-    assert fake.context_kwargs.get("proxy") == browser_mod._BLACKHOLE_PROXY
-    assert "<-loopback>" in browser_mod._BLACKHOLE_PROXY["bypass"]
-    assert len(fake.routes) == 1 and isinstance(fake.routes[0], browser_mod._GuardedEgress)
+    assert fake.context_kwargs.get("proxy") == {"server": "http://egress:8899", "bypass": "<-loopback>"}
+    assert fake.routes == [], "ağ katmanı denetlerken istek yakalanmaz"
+    assert fake.calls[-1] == ("close",)
+
+
+def test_browser_without_proxy_falls_back_to_url_filter(public, monkeypatch, no_egress_proxy):
+    start = public.url("/page")
+    fake = _FakePlaywright(start, [start])
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
+    assert browser_mod.fetch_with_browser(start) == "<html>tarayici-icerik</html>"
+    assert "proxy" not in fake.context_kwargs
+    assert fake.routes == [browser_mod._guard_route]
 
 
 class _FakeRoute:
-    """Playwright Route yerine: tarayıcının yaptığı bir istek ve ona verilen karar."""
-
-    def __init__(self, url, *, method="GET", resource_type="document", navigation=False, frame="sub"):
+    def __init__(self, url):
         self.decision = None
-        main = object()
-        self.page = types.SimpleNamespace(main_frame=main)
-        self.request = types.SimpleNamespace(
-            url=url, method=method, resource_type=resource_type, headers={"user-agent": "UA", "host": "x"},
-            post_data_buffer=None, frame=main if frame == "main" else object(),
-            is_navigation_request=lambda: navigation,
-        )
+        self.request = types.SimpleNamespace(url=url)
 
-    def continue_(self):
+    async def continue_(self):
         self.decision = ("continue",)
 
-    def abort(self, reason=None):
+    async def abort(self, reason=None):
         self.decision = ("abort", reason)
 
-    def fulfill(self, status=None, headers=None, body=None):
-        self.decision = ("fulfill", status, body)
 
-
-def _egress_for(route):
-    ctx = types.SimpleNamespace(cookies=lambda url: [])
-    return browser_mod._GuardedEgress(ctx, route.page)
-
-
-def test_browser_egress_fetches_through_netguard(internal, public):
-    """Tarayıcı isteği worker'da netguard ile yapılır; yönlendirme adımları da denetlenir."""
-    public.routes["/to-internal"] = (302, {"Location": internal.url("/secret")}, "")
-    public.routes["/to-page"] = (302, {"Location": "/page"}, "")
-    cases = [
-        _FakeRoute(internal.url("/secret"), resource_type="fetch"),
-        _FakeRoute("http://169.254.169.254/latest/meta-data/", resource_type="script"),
-        _FakeRoute(public.url("/to-internal"), resource_type="script"),   # alt kaynak: 302 -> iç
-        _FakeRoute(public.url("/to-internal"), navigation=True),          # iframe gezinmesi: 302 -> iç
-        _FakeRoute(public.url("/to-page"), resource_type="xhr"),          # güvenli yönlendirme izlenir
-        _FakeRoute(public.url("/page"), resource_type="stylesheet"),
-        _FakeRoute(public.url("/page"), resource_type="image"),           # hiç istenmez
-        _FakeRoute("data:text/plain,x", resource_type="fetch"),
-    ]
-    for route in cases:
-        _egress_for(route)(route)
-    decisions = [r.decision for r in cases]
-    assert decisions == [
-        ("abort", "blockedbyclient"),
-        ("abort", "blockedbyclient"),
-        ("abort", "blockedbyclient"),
-        ("abort", "blockedbyclient"),
-        ("fulfill", 200, b"<html>genel-sayfa</html>"),
-        ("fulfill", 200, b"<html>genel-sayfa</html>"),
-        ("abort", "blockedbyclient"),
-        ("continue",),
-    ]
-    assert internal.hits == [], "iç adrese hiç istek gitmemeli"
-    assert public.hits.count(("GET", "/page")) == 2
-
-
-def test_browser_main_navigation_redirect_becomes_checked_navigation(internal, public):
-    """Ana gezinmenin yönlendirmesi tarayıcıya verilmez; hedef kaydedilip yeni gezinme olur."""
-    public.routes["/to-internal"] = (302, {"Location": internal.url("/secret")}, "")
-    route = _FakeRoute(public.url("/to-internal"), navigation=True, frame="main")
-    egress = _egress_for(route)
-    egress(route)
-    assert route.decision == ("abort", "aborted")
-    assert egress.redirect_to == internal.url("/secret")
+def test_browser_fallback_filter_decisions(internal, public):
+    cases = {
+        internal.url("/secret"): ("abort", "blockedbyclient"),
+        "http://169.254.169.254/latest/meta-data/": ("abort", "blockedbyclient"),
+        "http://localhost:9222/json": ("abort", "blockedbyclient"),
+        public.url("/page"): ("continue",),
+        "data:text/plain,x": ("continue",),
+    }
+    for url, expected in cases.items():
+        route = _FakeRoute(url)
+        asyncio.run(browser_mod._guard_route(route))
+        assert route.decision == expected, url
     assert internal.hits == []
 
 
-def test_browser_goto_follows_redirect_only_after_check(monkeypatch):
-    from playwright.sync_api import Error as PlaywrightError
+def test_browser_session_has_hard_deadline(public, monkeypatch):
+    """Ana iş parçacığını kilitleyen sayfada page.content() asılı kalır; oturum yine süre sınırında biter."""
+    import time
 
-    egress = browser_mod._GuardedEgress(None, None)
-    plan = {"http://a.example/": "http://10.0.0.5/admin"}
-    visited = []
-
-    class Page:
-        def goto(self, url, **kw):
-            visited.append(url)
-            if url in plan:
-                egress.redirect_to = plan[url]
-                raise PlaywrightError("net::ERR_ABORTED")
-            return "resp"
-
-    with pytest.raises(netguard.UnsafeURLError):
-        browser_mod._goto(Page(), egress, "http://a.example/")
-    assert visited == ["http://a.example/"], "iç hedefe gezinme hiç başlatılmamalı"
-
-    plan = {"http://a.example/": "http://a.example/b", "http://a.example/b": "http://c.example/"}
-    assert browser_mod._goto(Page(), egress, "http://a.example/") == "resp"
-    assert visited[1:] == ["http://a.example/", "http://a.example/b", "http://c.example/"]
+    monkeypatch.setattr(settings, "request_timeout", 0.2)
+    start = public.url("/page")
+    fake = _FakePlaywright(start, [start], content_delay=3600)
+    monkeypatch.setattr(browser_mod, "async_playwright", fake)
+    t0 = time.monotonic()
+    assert browser_mod.fetch_with_browser(start) is None
+    assert time.monotonic() - t0 < 0.2 * browser_mod._DEADLINE_FACTOR + 2
+    assert fake.calls[-1] == ("close",), "süre dolunca bağlam/bağlantı kapatılmalı"
 
 
 def test_browser_request_allowed_helper(public):

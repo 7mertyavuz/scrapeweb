@@ -10,12 +10,13 @@
 #     `docker compose` açıklayıcı bir hatayla durur.
 #   - API'yi ağa açmak isterseniz .env içinde API_BIND_ADDR=0.0.0.0 yapın
 #     (API, API_KEY ile korunur).
-#   - Ağ ayrımı: browserless (uzak tarayıcı) yalnız `browser` ağındadır;
-#     Redis/Postgres/Jaeger/Flower/API'nin bulunduğu `backend` ağını göremez.
-#     Yönlendirilen ya da ele geçirilen bir tarayıcı sayfası bu servislere
-#     adıyla ulaşamaz. Worker iki ağda da olduğu için browserless'a bağlanır.
-#     Sayfanın HTTP(S) istekleri tarayıcıdan değil worker'dan (netguard ile)
-#     yapılır; tarayıcının doğrudan çıkışı kapalıdır (bkz. core/browser.py).
+#   - Ağ ayrımı (tarayıcı yolunun SSRF koruması): browserless yalnız `browser`
+#     ağındadır ve bu ağ `internal`dır: oradan internete, host'a (yayımlanmış
+#     portlar, host.docker.internal) ve `backend` ağına (Redis/Postgres/Jaeger/
+#     Flower/API) yol yoktur. Tarayıcının tek çıkışı `egress` servisidir
+#     (core/egress_proxy.py): her bağlantının hedefini netguard ile denetler,
+#     iç/özel adresleri reddeder ve denetlenen IP'ye bağlanır. Worker,
+#     browserless'a bağlanmak için `browser` ağında da bulunur.
 
 # api / worker / flower için ortak ayarlar
 x-app-env: &app-env
@@ -33,8 +34,11 @@ x-app-env: &app-env
 networks:
   # Uygulama servisleri ve veri katmanı.
   backend:
-  # Yalnız worker <-> browserless. internal DEĞİL: tarayıcı internete çıkabilmeli.
+  # browserless + worker + egress. internal: bu ağdan dışarıya (internet, host) yol yok.
   browser:
+    internal: true
+  # Yalnız egress proxy'sinin internete çıkışı.
+  outbound:
 
 services:
   redis:
@@ -73,13 +77,27 @@ services:
     environment:
       MAX_CONCURRENT_SESSIONS: 10
       TOKEN: ${BROWSERLESS_TOKEN:?BROWSERLESS_TOKEN ayarlanmamış - .env.example dosyasına bakın}
-      # SSRF: tarayıcının HTTP/WebSocket çıkışı core/browser.py'de kapalı (istekler
-      # worker'da netguard ile yapılır). WebRTC'nin UDP'si (STUN/TURN) proxy'ye
-      # uğramaz; bu bayrak olmadan sayfa iç adreslere UDP paketi gönderebilir.
+      # Ek savunma: WebRTC'nin UDP'si (STUN/TURN) proxy'ye uğramaz; bu bayrakla
+      # tarayıcı proxy dışı UDP kullanmaz. (internal ağ zaten dışarıya yol vermez.)
       DEFAULT_LAUNCH_ARGS: '["--webrtc-ip-handling-policy=disable_non_proxied_udp"]'
-    ports:
-      - "127.0.0.1:3000:3000"
+    # Port yok: internal ağdaki konteynerin portu yayımlanamaz; browserless'ın
+    # 127.0.0.1:3000 portunu `egress` servisi taşır.
     networks: [browser]
+
+  # Tarayıcının tek çıkış noktası: SSRF denetimli HTTP/CONNECT proxy'si.
+  egress:
+    build: .
+    command: python -m core.egress_proxy --port 8899 --forward 3000=browserless:3000
+    environment:
+      ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
+    ports:
+      - "127.0.0.1:3000:3000"   # browserless (token ister)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8899), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [browser, outbound]
 
   # Dağıtık İzleme (Distributed Tracing) Arayüzü — kimlik doğrulaması yok,
   # bu yüzden yalnız yerel makineye açık.
@@ -110,7 +128,10 @@ services:
   worker:
     build: .
     command: celery -A workers.celery_app.celery_app worker --loglevel=info --concurrency=4
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # Tarayıcının tüm trafiği bu proxy'den (browserless'ın gördüğü adresle).
+      BROWSER_EGRESS_PROXY: http://egress:8899
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -120,6 +141,8 @@ services:
         condition: service_healthy
       browserless:
         condition: service_started
+      egress:
+        condition: service_healthy
       jaeger:
         condition: service_started
     networks: [backend, browser]

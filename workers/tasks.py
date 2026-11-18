@@ -4,7 +4,7 @@ Webhook (Olay Güdümlü) ve Otonom (Playwright/AI) mantığı eklendi.
 """
 from __future__ import annotations
 import json
-from urllib.parse import urljoin
+from urllib.parse import urldefrag, urljoin
 from bs4 import BeautifulSoup
 from celery import shared_task, Task, chord, group
 
@@ -166,8 +166,10 @@ def discover_catalog(
     page_url = start_url or urljoin(base, "catalogue/page-1.html")
     pages_done = 0
     book_urls: list[str] = []
+    visited: set[str] = set()
 
     while page_url and pages_done < max_pages:
+        visited.add(urldefrag(page_url).url)
         html = fetcher.get(page_url)
         if not html: break
         soup = BeautifulSoup(html, "html.parser")
@@ -179,8 +181,12 @@ def discover_catalog(
                 book_urls.append(book_url)
 
         nxt = soup.select_one("li.next a")
-        # Ayrıştırılamayan "sonraki sayfa" bağlantısında sayfalama burada biter.
-        page_url = _join_link(page_url, nxt.get("href")) if nxt else None
+        href = (nxt.get("href") or "").strip() if nxt else ""
+        # Ayrıştırılamayan, boş ya da daha önce çekilmiş bir sayfaya (kendisi, döngü)
+        # götüren "sonraki sayfa" bağlantısında sayfalama burada biter.
+        page_url = _join_link(page_url, href) if href else None
+        if page_url and urldefrag(page_url).url in visited:
+            page_url = None
         pages_done += 1
 
     meta = {"pages_scanned": pages_done, "books_dispatched": len(book_urls), "ai_used": use_ai}

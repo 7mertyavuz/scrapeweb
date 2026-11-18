@@ -117,6 +117,7 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir. `GET /status/{task_
 | `INCREMENTAL` | `false` | Sadece içerik değiştiğinde yeniden işle |
 | `DEDUP_TTL` | `86400` | Kaydedilen bir URL'nin "görüldü" kaldığı saniye (Redis ve bellek içi) |
 | `BROWSERLESS_URL` | `ws://localhost:3000` | AI modu için headless Chrome |
+| `BROWSER_EGRESS_PROXY` | (boş; compose: `http://egress:8899`) | Tarayıcının tüm trafiğini gönderdiği SSRF denetimli proxy, browserless'ın gördüğü adresle; boş = yalnız uygulama içi URL süzgeci |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Yerel LLM endpoint'i |
 | `JAEGER_ENDPOINT` | `http://localhost:4318/v1/traces` | OpenTelemetry trace'leri |
 
@@ -167,7 +168,8 @@ Uygulamayı çalıştırmak için `requirements.txt` yeterlidir; `requirements-d
 | `redis` | Broker + Bloom filter + dead-letter | `6379`, `8001` |
 | `postgres` | Kalıcı ilişkisel depolama | `5432` |
 | `flower` | Celery izleme arayüzü | `5555` |
-| `browserless` | Dinamik/AI modu için headless Chrome | `3000` |
+| `browserless` | Dinamik/AI modu için headless Chrome | `3000` (`egress` yayımlar) |
+| `egress` | Tarayıcının tek çıkışı: SSRF denetimli proxy (`core/egress_proxy.py`) | — |
 | `jaeger` | Dağıtık izleme arayüzü | `16686` |
 
 Tüm portlar yalnız `127.0.0.1`'e yayınlanır. API'yi ağa açmak için `.env` içinde `API_BIND_ADDR=0.0.0.0` yapın.
@@ -176,20 +178,19 @@ Tüm portlar yalnız `127.0.0.1`'e yayınlanır. API'yi ağa açmak için `.env`
 
 - **API anahtarı:** `API_KEY`'in varsayılanı yoktur. Yazma uçları ve `PUBLIC_READ=true` değilse veri okuma uçları `X-API-Key` ister; `/`, `/static/*`, `/health` ve `/metrics` açık kalır.
 - **Hedefler:** Kazıma hedefleri ve `webhook_url` yalnız genel `http`/`https` adresleri olabilir; loopback, özel ağ, link-local (bulut metadata) ve benzeri adresler reddedilir. Ana makine adı bağlanmadan önce çözülüp denetlenir, denetlenen IP sabitlenir (curl'e denetlenen adla yeniden kurulmuş URL verilir; sonda nokta gibi yazımlar sabitlemeyi atlatamaz) ve her yönlendirme yeniden denetlenir (webhook yönlendirme izlemez). `ALLOW_PRIVATE_NETWORKS=true` yerel geliştirme için adres denetimlerini kapatır.
-- **Tarayıcı/AI modu:** Tarayıcı ağa kendisi çıkmaz. Sayfanın her HTTP(S) isteği worker'da aynı denetimle yapılıp tarayıcıya verilir; WebSocket ve diğer doğrudan bağlantılar kapalıdır. Bu yol daha yavaştır ve resim, medya ve yazı tipi yüklemez.
+- **Tarayıcı/AI modu:** Compose kurulumunda browserless'ın internete, host'a ve diğer servislere yolu yoktur. Tek çıkışı `egress` proxy'sidir: tarayıcının açtığı her bağlantı (sayfa, yönlendirmeler, alt kaynaklar, fetch/XHR, WebSocket) ondan geçer; her hedef kazıma hedefleriyle aynı denetimden geçer ve bağlantı denetlenen IP'ye açılır. Bir tarayıcı oturumu 1,5 × `REQUEST_TIMEOUT` sonunda kesilir.
 - **CORS**, `CORS_ORIGINS` origin listelemedikçe kapalıdır.
-- **Docker varsayılanları:** Portlar `127.0.0.1`'e bağlı; Redis, Postgres, browserless ve Flower `.env`'deki parola/token'ı ister; imaj root olmayan kullanıcıyla çalışır. browserless ayrı bir `browser` ağında çalışır; Redis, Postgres, Jaeger ve Flower'a adıyla ulaşamaz.
+- **Docker varsayılanları:** Portlar `127.0.0.1`'e bağlı; Redis, Postgres, browserless ve Flower `.env`'deki parola/token'ı ister; imaj root olmayan kullanıcıyla çalışır. browserless yalnız worker ve `egress` ile paylaştığı `internal` bir `browser` ağında çalışır; Redis, Postgres, Jaeger, Flower'a ve host'a ulaşamaz.
 - **Panel:** Sunucu verisi HTML olarak değil, düz metin olarak basılır.
 
 Bilinen sınırlar:
 
-- browserless'ı verilen compose dosyası dışında çalıştırıyorsanız `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]` verin; bu olmadan sayfa WebRTC ile iç adreslere UDP paketi gönderebilir.
-- Tarayıcı/AI modunda DNS rebinding yapı gereği kapalıdır (istekleri worker denetlenen IP'yi sabitleyerek yapar), ancak gerçek bir rebinding DNS sunucusuyla denenmedi.
+- Verilen compose dosyası dışında (`BROWSER_EGRESS_PROXY` boş) tarayıcı yolunda yalnız uygulama içi bir URL süzgeci vardır: her HTTP(S) isteğinin URL'sini ve gezinmenin yönlendirme zincirini denetler; yönlendirme adımlarını (denemede iç dinleyiciye kör istek olarak ulaştılar; içerikleri dönmedi), açılır pencereleri, tarayıcının kendi DNS çözümlemesini (rebinding), WebSocket ve WebRTC'yi denetleyemez. Tam koruma için browserless'ı tek çıkışı `python -m core.egress_proxy` olacak şekilde kurun (compose dosyasındaki gibi) ve `BROWSER_EGRESS_PROXY` verin.
+- WebRTC'nin UDP'si proxy'den geçmez. Compose dosyası onu `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]` ile kapatır; bu bayrak olmadan sayfa `browser` ağındaki diğer konteynerlere (worker, `egress`) yine UDP paketi gönderebilir. browserless'ı kendiniz çalıştırıyorsanız aynı bayrağı verin.
+- Tarayıcı yolunda DNS rebinding: proxy her adı bir kez çözer ve denetlenen IP'ye bağlanır; bu bölünmüş DNS ile denendi, gerçek bir rebinding DNS sunucusuyla denenmedi.
 - Proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) kullanılırken IP sabitleme ve bağlanılan IP denetimi uygulanmaz.
 - Hız sınırı (rate limiting) yoktur.
 - `/docs` (OpenAPI arayüzü) açıktır.
-- Tarayıcı/AI modunda WebSocket çalışmaz.
-- Docker'da browserless, host'a yayımlanmış portlara IP ile ve `host.docker.internal` üzerinden hâlâ ulaşabilir.
 
 **Yükseltme:** Eski sürümler belgelerde sabit bir varsayılan API anahtarı yayımlıyordu. Bu anahtar artık her zaman reddedilir; onunla kurulum yaptıysanız yeni, rastgele bir `API_KEY` ayarlayın. Eski sürümler tekilleştirmeyi ömürsüz tek bir `scrapehub:seen_urls` anahtarında tutuyordu; yeni kod ona bakmaz, `docker compose exec redis redis-cli DEL scrapehub:seen_urls` ile silebilirsiniz.
 

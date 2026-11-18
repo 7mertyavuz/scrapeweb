@@ -122,6 +122,7 @@ ScrapeProjem/
 ├── core/
 │   ├── config.py          # Tüm ayarların tek merkezi (env'den okur, default'ları var)
 │   ├── dedup.py           # Tekilleştirme: Bloom filter + içerik-hash
+│   ├── egress_proxy.py    # Tarayıcının tek çıkışı: SSRF denetimli HTTP/CONNECT proxy'si (compose `egress`)
 │   ├── fetcher.py         # Nazik HTTP indirici (retry/backoff/robots/gecikme)
 │   └── netguard.py        # Giden istek koruması (SSRF): URL/IP denetimi, yönlendirme takibi
 ├── parser/
@@ -140,13 +141,14 @@ ScrapeProjem/
 │   ├── test_incremental.py# Domain gecikme + içerik-hash mantığı
 │   ├── test_deadletter.py # Retry tetikleyici + dead-letter yönlendirme
 │   ├── test_netguard.py   # SSRF koruması: iç adres, yönlendirme, webhook, tarayıcı
+│   ├── test_egress_proxy.py # Tarayıcı çıkış proxy'si: iç hedef reddi, denetlenen IP'ye bağlanma
 │   └── verify_bloom.py    # CANLI RedisBloom doğrulaması (test değil, elle çalıştırılır)
 ├── run_local.py           # Redis/Celery KURMADAN tüm pipeline'ı senkron çalıştırır
 ├── requirements.txt       # Python bağımlılıkları (çalışma zamanı)
 ├── requirements-dev.txt   # Test bağımlılıkları (requirements.txt + pytest vb.)
 ├── .env.example           # Docker için örnek ortam dosyası (sırlar burada doldurulur)
 ├── Dockerfile             # API/worker imajı
-├── docker-compose.yml     # redis + postgres + api + worker + flower
+├── docker-compose.yml     # redis + postgres + api + worker + flower + browserless + egress
 ├── README.md              # Hızlı başlangıç
 └── DOKUMANTASYON.md       # (bu dosya) ayrıntılı rehber
 ```
@@ -317,14 +319,19 @@ gerek yoktur. Onun yerine **sağlam mühendislik**:
   döner. Webhook da aynı denetimden geçer ama yönlendirme izlemez. Proxy kullanılırken IP sabitleme
   uygulanmaz. `ALLOW_PRIVATE_NETWORKS=true` yerel geliştirme için IP denetimlerini kapatır (şema
   denetimi kalır).
-- **Tarayıcı/AI modu (`core/browser.py`):** Tarayıcı ağa **kendisi çıkmaz**. Sayfanın her HTTP(S)
-  isteği (ana gezinme, alt kaynaklar, fetch/XHR) yakalanır, worker'da aynı `guarded_request`
-  denetimiyle yapılır ve yanıt tarayıcıya verilir. Ana gezinmedeki yönlendirme de önce denetlenir,
-  sonra yeni bir gezinme olarak açılır. WebSocket ve diğer doğrudan bağlantılar hiçbir yere
-  çıkmayan bir proxy'ye yönlenip başarısız olur; service worker'lar kapalıdır. Bu yol daha
-  yavaştır ve resim, medya ve yazı tipi yüklemez. Compose'da browserless ayrı bir `browser`
-  ağındadır ve Redis/Postgres/Jaeger/Flower'a adıyla ulaşamaz. Kalan sınırlar README'deki
-  "Known limitations" listesindedir.
+- **Tarayıcı/AI modu (`core/browser.py`, `core/egress_proxy.py`):** Koruma ağ katmanındadır.
+  Compose'da browserless yalnız `internal` olan `browser` ağındadır (worker ve `egress` ile
+  birlikte): internete, host'a ve `backend` ağına (Redis/Postgres/Jaeger/Flower/API) yolu yoktur.
+  Tek çıkışı `egress` servisidir: tarayıcı bağlamı (`BROWSER_EGRESS_PROXY`) tüm trafiğini ona
+  yollar (HTTPS ve WebSocket için `CONNECT`, düz HTTP için mutlak URL'li istek). Proxy her
+  bağlantının hedefini `check_url` ile denetler (iç/özel adres, tek etiketli ad → `403`) ve
+  denetlenen IP'ye bağlanır; ana gezinme, yönlendirmeler, alt kaynaklar, fetch/XHR ve WebSocket
+  tarayıcının kendi ağ yığınıyla, ama tek tek denetlenerek gider (DNS rebinding yok: adı
+  proxy bir kez çözer). Hedef URL tarayıcıya verilmeden önce worker'da da denetlenir, gezinmenin
+  yönlendirme zinciri sonradan kontrol edilir; service worker'lar kapalıdır. Tüm oturum
+  1,5 × `REQUEST_TIMEOUT` sonunda kesilir (ana iş parçacığını kilitleyen sayfaya karşı).
+  `BROWSER_EGRESS_PROXY` boşsa (compose dışı) yalnız uygulama içi URL süzgeci çalışır. Kalan
+  sınırlar README'deki "Known limitations" listesindedir.
 
 `get(url)` başarısızsa `None` döndürür; çağıran taraf (görev) buna göre retry/dead-letter
 kararı verir.
@@ -565,10 +572,14 @@ celery -A workers.celery_app.celery_app flower --port=5555                      
 API'yi başlatmadan önce `API_KEY` ortam değişkenini ayarla; yoksa korumalı uçlar her isteği
 `401` ile reddeder.
 
-AI/tarayıcı modu için browserless'ı compose dışında kendin çalıştırıyorsan compose'daki ayarı
-ver: `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]`. Bu bayrak
-olmadan sayfa WebRTC ile iç adreslere UDP paketi gönderebilir (WebRTC UDP'si tarayıcının
-kapatılan çıkışından geçmez). Worker'a `BROWSERLESS_URL` ile adresini ver.
+AI/tarayıcı modu için browserless'ı compose dışında kendin çalıştırıyorsan worker'a
+`BROWSERLESS_URL` ile adresini ver. `BROWSER_EGRESS_PROXY` boşsa tarayıcı yolunda yalnız
+uygulama içi URL süzgeci vardır (yönlendirme adımlarını, açılır pencereleri, tarayıcının DNS
+çözümlemesini, WebSocket ve WebRTC'yi denetleyemez). Tam koruma için compose'daki düzeni kur: browserless'ın
+tek çıkışı `python -m core.egress_proxy` olsun, `BROWSER_EGRESS_PROXY`'ye proxy'nin
+browserless'tan görünen adresini yaz ve browserless'a
+`DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]` ver (WebRTC UDP'si
+proxy'den geçmez).
 
 ---
 
@@ -599,7 +610,8 @@ zorlar (gerçek Redis gerektirmez) ve güvenlik ayarlarını varsayılana çekip
 | `test_incremental.py` | Domain-bazlı gecikme + `content_changed` (yeni→aynı→değişti) |
 | `test_deadletter.py` | Fetch hatası `FetchError` fırlatır; `on_failure` dead-letter'a yazar |
 | `test_main.py` | API endpoint'leri (frontend, stats, books, health, metrics, yetkilendirme, girdi sınırları, iç ağ URL'lerinin reddi, CORS) |
-| `test_netguard.py` | SSRF koruması: IP sınıflandırma, iç adrese yönlendirme, webhook, tarayıcı yolu |
+| `test_netguard.py` | SSRF koruması: IP sınıflandırma, iç adrese yönlendirme, webhook, tarayıcı yolu (proxy ayarı, yedek URL süzgeci, oturum süre sınırı) |
+| `test_egress_proxy.py` | Tarayıcı çıkış proxy'si: düz HTTP ve `CONNECT` ile iç/özel hedef, tek etiketli ad ve sayısal IP yazımları reddedilir; bağlantı denetlenen IP'ye açılır (rebinding); `ALLOW_PRIVATE_NETWORKS` |
 
 Ayrıca `tests/verify_bloom.py` (test değil, elle çalıştırılır): **canlı** bir Redis Stack'e
 karşı `backend == "redis-bloom"`, `BF.ADD/EXISTS` davranışını ve dilimli dedup ömrünü kanıtlar:
@@ -640,6 +652,7 @@ default'a sahiptir. Tek istisna `API_KEY`: varsayılanı yoktur; `run_local.py` 
 | `ALLOW_PRIVATE_NETWORKS` | `false` | `true` → iç/özel ağ hedeflerine izin (yalnız yerel geliştirme) |
 | `MAX_PAGES_LIMIT` | `100` | API'nin kabul ettiği en büyük `max_pages` |
 | `BROWSERLESS_URL` | `ws://localhost:3000` | Tarayıcı/AI modu için browserless (headless Chrome) adresi |
+| `BROWSER_EGRESS_PROXY` | (boş) | Tarayıcının tüm trafiğini yolladığı SSRF denetimli proxy (`core/egress_proxy.py`), browserless'tan görünen adresle; compose'da `http://egress:8899`. Boş = yalnız URL süzgeci |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | AI ayrıştırma için yerel Ollama (LLM) adresi |
 | `JAEGER_ENDPOINT` | `http://localhost:4318/v1/traces` | OpenTelemetry trace'lerinin gönderildiği OTLP HTTP adresi |
 
@@ -647,8 +660,9 @@ Docker Compose ayrıca `.env`'den `REDIS_PASSWORD`, `POSTGRES_PASSWORD`, `BROWSE
 `FLOWER_PASSWORD` (zorunlu), `POSTGRES_USER`, `POSTGRES_DB`, `FLOWER_USER` ve `API_BIND_ADDR`
 (varsayılan `127.0.0.1`) okur; ayrıntı `.env.example`'da. `PUBLIC_READ`, `CORS_ORIGINS`,
 `ALLOW_PRIVATE_NETWORKS`, `MAX_PAGES_LIMIT` ve `OLLAMA_URL` (compose'da varsayılan
-`http://host.docker.internal:11434`) `.env`'den api/worker/flower'a geçirilir; `REDIS_URL`,
-`DATABASE_URL`, `BROWSERLESS_URL` ve `JAEGER_ENDPOINT` compose'da servis adlarıyla kurulur.
+`http://host.docker.internal:11434`) `.env`'den api/worker/flower'a geçirilir
+(`ALLOW_PRIVATE_NETWORKS` ayrıca `egress`'e); `REDIS_URL`, `DATABASE_URL`, `BROWSERLESS_URL`,
+`BROWSER_EGRESS_PROXY` ve `JAEGER_ENDPOINT` compose'da servis adlarıyla kurulur.
 
 `POST /scrape` gövdesi: `start_url`, `max_pages` (1–`MAX_PAGES_LIMIT`), `chunk_size` (1–100),
 `webhook_url`.

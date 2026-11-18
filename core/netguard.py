@@ -154,7 +154,10 @@ def _split(url: Any) -> SplitResult:
         raise UnsafeURLError(f"URL çok uzun (en çok {MAX_URL_LENGTH} karakter)")
     if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in url) or "\\" in url:
         raise UnsafeURLError("URL boşluk, kontrol karakteri ya da ters bölü içeremez")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)  # ör. "https://[cdn]/x" ValueError fırlatır
+    except ValueError as exc:
+        raise UnsafeURLError("URL ayrıştırılamadı") from exc
     if parts.scheme.lower() not in ALLOWED_SCHEMES:
         raise UnsafeURLError("yalnız http ve https URL'lerine izin verilir")
     if "@" in parts.netloc:
@@ -162,9 +165,12 @@ def _split(url: Any) -> SplitResult:
     if not parts.hostname:
         raise UnsafeURLError("URL'de ana makine adı yok")
     try:
-        parts.port  # geçersiz port ValueError fırlatır
+        port = parts.port  # geçersiz port ValueError fırlatır
     except ValueError as exc:
         raise UnsafeURLError("geçersiz port") from exc
+    if port == 0:
+        # Bağlanılamaz; ayrıca "denetlenen port (varsayılan) != curl'e giden URL'deki port" olurdu.
+        raise UnsafeURLError("geçersiz port")
     return parts
 
 
@@ -215,7 +221,7 @@ def check_url(url: Any, *, resolve: bool = True) -> Target:
     """
     parts = _split(url)
     host, literal = _normalize_host(parts)
-    port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    port = parts.port if parts.port is not None else (443 if parts.scheme.lower() == "https" else 80)
     req_url = _request_url(parts, host)
 
     if _allow_private():
@@ -302,7 +308,10 @@ def guarded_request(
             if max_redirects == 0:
                 return resp  # yönlendirme izlenmiyor; 3xx yanıtını olduğu gibi döndür
             raise TooManyRedirects(f"yönlendirme sınırı aşıldı ({max_redirects}): {url}")
-        next_url = urljoin(current_url, location)
+        try:
+            next_url = urljoin(current_url, location)
+        except ValueError as exc:  # ör. "Location: https://[cdn]/x"; kalıcı hata say
+            raise UnsafeURLError(f"yönlendirme hedefi ayrıştırılamadı: {location!r}") from exc
         logger.debug("[netguard] yönlendirme %s -> %s", current_url, next_url)
         if resp.status_code == 303 or (resp.status_code in (301, 302) and current_method == "POST"):
             current_method, body_kwargs = "GET", {}
