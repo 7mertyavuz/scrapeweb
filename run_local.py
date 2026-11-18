@@ -22,7 +22,7 @@ from storage.db import count_books, init_db, upsert_book
 
 
 def scrape_book_sync(url: str) -> str:
-    if dedup.check_and_mark(url):
+    if dedup.seen(url):
         return "skip(dup)"
     html = fetcher.get(url)
     if not html:
@@ -31,6 +31,7 @@ def scrape_book_sync(url: str) -> str:
     if not book:
         return "parse_failed"
     upsert_book(book)
+    dedup.mark(url)  # yalnız başarılı yazımdan sonra: başarısız URL bir sonraki koşuda yeniden denenir
     return f"ok: {book.title[:40]} (£{book.price})"
 
 

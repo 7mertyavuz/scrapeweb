@@ -41,7 +41,8 @@ def test_on_failure_routes_to_dead_letter(monkeypatch):
 
 
 def test_push_dead_letter_falls_back_to_log_without_redis(caplog, monkeypatch):
-    monkeypatch.setattr(tasks.dedup, "_client", None, raising=False)
+    from core.metrics import metrics
+    monkeypatch.setattr(metrics, "_client", None)
     with caplog.at_level(logging.ERROR, logger="workers.tasks"):
         tasks.push_dead_letter({"task": "x", "args": ["u"], "error": "boom"})
     assert "[dead-letter]" in caplog.text

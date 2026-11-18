@@ -2,11 +2,16 @@
 Katman 2: Tekilleştirme (Deduplication).
 
 Senin orijinal planındaki Redis Bloom Filter mantığı birebir burada.
-Amaç: bir URL son N saat içinde çekildiyse tekrar kuyruğa atma.
+Amaç: bir URL yakın zamanda (DEDUP_TTL, varsayılan 24 saat) başarıyla işlendiyse
+tekrar çekme.
 
 İki mod:
-  1. Redis Stack varsa  -> gerçek RedisBloom (BF.ADD / BF.EXISTS) - O(1), RAM'de, devasa ölçekli.
-  2. Redis yoksa        -> in-memory set fallback (tek makinede ders/test için yeterli).
+  1. Redis Stack varsa  -> gerçek RedisBloom (BF.INSERT / BF.EXISTS) - O(1), RAM'de, devasa ölçekli.
+     Bloom filtresinden tek öğe silinemez; bu yüzden ömür FİLTRENİN tamamına verilir:
+     filtre ilk işaretten DEDUP_TTL saniye sonra toptan silinir ve yeniden başlar
+     (URL başına değil, pencere başına süre).
+  2. Redis yoksa        -> in-memory set fallback (tek makinede ders/test için yeterli);
+     burada süre URL başınadır.
 
 Bloom filter neden? 500k URL'i bir SQL tablosunda "SELECT ... WHERE url=?" ile
 kontrol etmek pahalı. Bloom filter nanosaniyede "kesinlikle yok" veya "muhtemelen var"
@@ -91,17 +96,36 @@ class Deduplicator:
         k = _key(url)
         if self._client is not None:
             try:
-                self._client.execute_command("BF.ADD", self.BLOOM_NAME, k)
+                # BF.INSERT, filtre yoksa (ör. TTL ile silindiyse) onu ayarlı kapasite ve
+                # hata oranıyla yeniden kurar; BF.ADD varsayılan küçük parametreler kullanırdı.
+                self._client.execute_command(
+                    "BF.INSERT", self.BLOOM_NAME,
+                    "CAPACITY", settings.bloom_capacity,
+                    "ERROR", settings.bloom_error_rate,
+                    "ITEMS", k,
+                )
+                self._ensure_ttl()
                 return
             except Exception:
                 pass
         self._mem.add(k)
         self._mem_ttl[k] = time.time() + settings.dedup_ttl_sec
 
+    def _ensure_ttl(self) -> None:
+        """Filtrenin ömrü yoksa DEDUP_TTL ver; varsa uzatma (pencere ilk işaretten başlar)."""
+        try:
+            if self._client.ttl(self.BLOOM_NAME) == -1:   # -1: anahtar var, ömrü yok
+                self._client.expire(self.BLOOM_NAME, settings.dedup_ttl_sec)
+        except Exception:
+            pass  # ömür verilemese de işaret yazıldı
+
     def check_and_mark(self, url: str) -> bool:
         """
-        Atomik: görülmediyse işaretle ve False döndür (=işle),
-        görülmüşse True döndür (=atla).
+        Görülmediyse işaretle ve False döndür (=işle), görülmüşse True döndür (=atla).
+        (Atomik değildir: seen + mark iki ayrı adımdır.)
+
+        Not: görevler bunu kullanmaz; URL'yi ancak başarılı yazımdan sonra mark() ile
+        işaretler, böylece başarısız bir deneme URL'yi "görüldü" bırakmaz.
         """
         if self.seen(url):
             return True
@@ -109,25 +133,29 @@ class Deduplicator:
         return False
 
     # --- Incremental (artımlı) güncelleme: içerik-hash karşılaştırma ---
-    def content_changed(self, url: str, html: str) -> bool:
+    def content_changed(self, url: str, html: str, *, remember: bool = True) -> bool:
         """
         Sayfanın İÇERİĞİ son görülenden farklı mı?
-          - Yeni URL ya da içerik değişmiş  -> True  (yeniden işle) + yeni hash'i sakla.
+          - Yeni URL ya da içerik değişmiş  -> True  (yeniden işle) + (remember ise) yeni hash'i sakla.
           - İçerik aynı                      -> False (atla).
 
         URL-bazlı bloom dedup "bu URL'i hiç gördük mü?" sorusuna bakar; bu metot ise
         "gördüğümüzden bu yana sayfa değişti mi?" sorusuna bakar (incremental güncelleme).
+
+        remember=False: yalnız karşılaştırır; hash'i iş başarıyla bitince
+        remember_content() ile saklamak çağıranın işidir (ayrıştırma/DB hatasında
+        sayfa bir sonraki koşuda "değişmemiş" sayılıp atlanmasın diye).
         """
-        new_hash = hashlib.sha1(html.encode("utf-8", "ignore")).hexdigest()
+        new_hash = _content_hash(html)
         k = _key(url)
 
         if self._client is not None:
             try:
-                rkey = self.CHASH_PREFIX + k
-                prev = self._client.get(rkey)
+                prev = self._client.get(self.CHASH_PREFIX + k)
                 if prev == new_hash:
                     return False
-                self._client.set(rkey, new_hash, ex=settings.content_hash_ttl_sec)
+                if remember:
+                    self.remember_content(url, html)
                 return True
             except Exception:
                 pass  # redis sorunlu -> memory'e düş
@@ -135,8 +163,25 @@ class Deduplicator:
         prev = self._mem_chash.get(k)
         if prev == new_hash:
             return False
-        self._mem_chash[k] = new_hash
+        if remember:
+            self._mem_chash[k] = new_hash
         return True
+
+    def remember_content(self, url: str, html: str) -> None:
+        """Sayfanın içerik hash'ini 'son işlenen sürüm' olarak sakla."""
+        new_hash = _content_hash(html)
+        k = _key(url)
+        if self._client is not None:
+            try:
+                self._client.set(self.CHASH_PREFIX + k, new_hash, ex=settings.content_hash_ttl_sec)
+                return
+            except Exception:
+                pass
+        self._mem_chash[k] = new_hash
+
+
+def _content_hash(html: str) -> str:
+    return hashlib.sha1(html.encode("utf-8", "ignore")).hexdigest()
 
 
 # tek paylaşımlı örnek

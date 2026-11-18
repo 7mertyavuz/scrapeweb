@@ -209,39 +209,36 @@ def list_dead_letter(
     limit: int = Query(100, ge=1, le=1000),
     _auth: Optional[str] = Depends(verify_read_access),
 ) -> dict:
-    """Son başarısız görevleri (dead-letter kuyruğu) döndür."""
-    items: list[dict] = []
-    client = getattr(dedup, "_client", None)
-    if client:
-        try:
-            raw_items = client.lrange("scrapehub:dead_letter", 0, limit - 1)
-            import json
-            for raw in raw_items:
-                with suppress(Exception):
-                    items.append(json.loads(raw))
-        except Exception as exc:
-            logger.warning("dead-letter okunamadı: %r", exc)
+    """Son başarısız görevleri (dead-letter kuyruğu) en yeniden eskiye döndür."""
+    items = metrics.dead_letters(limit)
     return {"items": items, "count": len(items)}
+
+
+def _redis_ok() -> bool:
+    """Redis'e (broker + dedup + metrikler) kısa zaman aşımlı doğrudan PING.
+
+    Her çağrıda yeni bağlantı: Redis sonradan ayağa kalkarsa da doğru sonuç verir.
+    """
+    try:
+        import redis  # type: ignore
+
+        client = redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            return bool(client.ping())
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.debug("redis health check hatası: %r", exc)
+        return False
 
 
 @app.get("/health")
 def health() -> dict:
     """Derin health-check: Redis ve PostgreSQL erişilebilirliğini kontrol et."""
     checks = {
-        "redis": False,
+        "redis": _redis_ok(),
         "database": False,
     }
-    try:
-        from celery.app.control import Control
-        ctrl = Control(celery_app)
-        checks["redis"] = ctrl.ping() is not None
-    except Exception as exc:
-        logger.debug("redis health check hatası: %r", exc)
-        # Broker'a direkt ping deneyelim
-        try:
-            checks["redis"] = celery_app.connection().heartbeat_check()
-        except Exception:
-            checks["redis"] = False
 
     try:
         checks["database"] = ping_db()
