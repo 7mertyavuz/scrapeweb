@@ -10,6 +10,11 @@
 #     `docker compose` açıklayıcı bir hatayla durur.
 #   - API'yi ağa açmak isterseniz .env içinde API_BIND_ADDR=0.0.0.0 yapın
 #     (API, API_KEY ile korunur).
+#   - Ağ ayrımı: browserless (uzak tarayıcı) yalnız `browser` ağındadır;
+#     Redis/Postgres/Jaeger/Flower/API'nin bulunduğu `backend` ağını göremez.
+#     Yönlendirilen ya da ele geçirilen bir tarayıcı sayfası bu servislere
+#     adıyla ulaşamaz. Worker iki ağda da olduğu için browserless'a bağlanır;
+#     browserless internete normal (bridge) ağ üzerinden çıkar.
 
 # api / worker / flower için ortak ayarlar
 x-app-env: &app-env
@@ -22,6 +27,13 @@ x-app-env: &app-env
   PUBLIC_READ: ${PUBLIC_READ:-false}
   CORS_ORIGINS: ${CORS_ORIGINS:-}
   ALLOW_PRIVATE_NETWORKS: ${ALLOW_PRIVATE_NETWORKS:-false}
+  MAX_PAGES_LIMIT: ${MAX_PAGES_LIMIT:-100}
+
+networks:
+  # Uygulama servisleri ve veri katmanı.
+  backend:
+  # Yalnız worker <-> browserless. internal DEĞİL: tarayıcı internete çıkabilmeli.
+  browser:
 
 services:
   redis:
@@ -37,6 +49,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks: [backend]
 
   postgres:
     image: postgres:16-alpine
@@ -51,6 +64,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks: [backend]
 
   # JavaScript render ve WAF bypass için Headless Chrome
   browserless:
@@ -60,6 +74,7 @@ services:
       TOKEN: ${BROWSERLESS_TOKEN:?BROWSERLESS_TOKEN ayarlanmamış - .env.example dosyasına bakın}
     ports:
       - "127.0.0.1:3000:3000"
+    networks: [browser]
 
   # Dağıtık İzleme (Distributed Tracing) Arayüzü — kimlik doğrulaması yok,
   # bu yüzden yalnız yerel makineye açık.
@@ -68,6 +83,7 @@ services:
     ports:
       - "127.0.0.1:16686:16686" # Web UI
       - "127.0.0.1:4318:4318"   # OTLP HTTP Alıcı
+    networks: [backend]
 
   api:
     build: .
@@ -84,6 +100,7 @@ services:
         condition: service_healthy
       jaeger:
         condition: service_started
+    networks: [backend]
 
   worker:
     build: .
@@ -100,6 +117,7 @@ services:
         condition: service_started
       jaeger:
         condition: service_started
+    networks: [backend, browser]
 
   flower:
     build: .
@@ -118,3 +136,4 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
+    networks: [backend]
