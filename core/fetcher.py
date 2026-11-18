@@ -12,6 +12,7 @@ from curl_cffi import requests
 
 from core.config import settings
 from core.logging import get_logger
+from core.netguard import UnsafeURLError, guarded_request
 
 logger = get_logger(__name__)
 
@@ -58,7 +59,10 @@ class Fetcher:
             proxies = {"http": current_proxy, "https": current_proxy} if current_proxy else None
 
             try:
-                resp = requests.get(
+                # SSRF korumalı istek: hedef ve her yönlendirme adımı doğrulanır,
+                # doğrulanan IP curl'e sabitlenir (bkz. core/netguard.py).
+                resp = guarded_request(
+                    "GET",
                     url,
                     impersonate=impersonate_browser,
                     proxies=proxies,
@@ -85,6 +89,10 @@ class Fetcher:
                     logger.warning("[skip] %s %s", resp.status_code, url)
                     return None
 
+            except UnsafeURLError as e:
+                # Politika ihlali kalıcıdır: yeniden deneme ya da proxy yükseltme yok.
+                logger.warning("[ssrf] engellendi: %s (%s)", url, e)
+                return None
             except requests.RequestsError as e:
                 last_err = e
                 # Ağ Hatası olursa da Proxy yükselt

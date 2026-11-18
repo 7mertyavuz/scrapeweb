@@ -4,7 +4,6 @@ Webhook (Olay Güdümlü) ve Otonom (Playwright/AI) mantığı eklendi.
 """
 from __future__ import annotations
 import json
-import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from celery import shared_task, Task, chord
@@ -14,6 +13,7 @@ from core.dedup import dedup
 from core.fetcher import fetcher
 from core.logging import get_logger
 from core.metrics import metrics
+from core.netguard import UnsafeURLError, guarded_request
 from parser.extract import parse
 from storage.db import init_db, upsert_book
 from core.browser import fetch_with_browser
@@ -58,7 +58,10 @@ def webhook_callback(results, webhook_url: str, meta: dict):
     }
     try:
         logger.info(f"Webhook tetikleniyor -> {webhook_url}")
-        requests.post(webhook_url, json=payload, timeout=5)
+        # SSRF korumalı: iç/özel adreslere gönderilmez, yönlendirme izlenmez.
+        guarded_request("POST", webhook_url, json=payload, timeout=5, max_redirects=0)
+    except UnsafeURLError as e:
+        logger.warning(f"Webhook engellendi (iç/özel ağ ya da geçersiz URL): {e}")
     except Exception as e:
         logger.error(f"Webhook gönderilemedi: {e}")
 
