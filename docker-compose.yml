@@ -13,8 +13,9 @@
 #   - Ağ ayrımı: browserless (uzak tarayıcı) yalnız `browser` ağındadır;
 #     Redis/Postgres/Jaeger/Flower/API'nin bulunduğu `backend` ağını göremez.
 #     Yönlendirilen ya da ele geçirilen bir tarayıcı sayfası bu servislere
-#     adıyla ulaşamaz. Worker iki ağda da olduğu için browserless'a bağlanır;
-#     browserless internete normal (bridge) ağ üzerinden çıkar.
+#     adıyla ulaşamaz. Worker iki ağda da olduğu için browserless'a bağlanır.
+#     Sayfanın HTTP(S) istekleri tarayıcıdan değil worker'dan (netguard ile)
+#     yapılır; tarayıcının doğrudan çıkışı kapalıdır (bkz. core/browser.py).
 
 # api / worker / flower için ortak ayarlar
 x-app-env: &app-env
@@ -72,6 +73,10 @@ services:
     environment:
       MAX_CONCURRENT_SESSIONS: 10
       TOKEN: ${BROWSERLESS_TOKEN:?BROWSERLESS_TOKEN ayarlanmamış - .env.example dosyasına bakın}
+      # SSRF: tarayıcının HTTP/WebSocket çıkışı core/browser.py'de kapalı (istekler
+      # worker'da netguard ile yapılır). WebRTC'nin UDP'si (STUN/TURN) proxy'ye
+      # uğramaz; bu bayrak olmadan sayfa iç adreslere UDP paketi gönderebilir.
+      DEFAULT_LAUNCH_ARGS: '["--webrtc-ip-handling-policy=disable_non_proxied_udp"]'
     ports:
       - "127.0.0.1:3000:3000"
     networks: [browser]

@@ -15,8 +15,8 @@ flower>=2.0,<3
 # Güvenlik katmanının (core/netguard.py, core/browser.py) dayandığı alt sınırlar:
 #   - curl_cffi 0.7.3: requests.exceptions.TooManyRedirects/DNSError
 #     (0.7.1'de yok; netguard içe aktarılırken çöker).
-#   - playwright 1.48: BrowserContext.route_web_socket. Daha eskisinde
-#     tarayıcının WebSocket bağlantıları SSRF süzgecinden SESSİZCE geçer.
+#   - playwright 1.48: core/browser.py'nin (route + fulfill + bağlam proxy'si)
+#     gerçek browserless/chrome:1.61.1 ile denendiği en eski sürüm.
 curl_cffi>=0.7.3,<1
 playwright>=1.48.0,<2
 requests>=2.31.0,<3

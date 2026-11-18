@@ -11,7 +11,9 @@ hedefi, webhook) ağa çıkmadan önce buradan geçer:
   CGNAT, ULA, multicast, ayrılmış aralıklar, IPv4-mapped/6to4/Teredo/NAT64
   içine gömülü iç adresler.
 * Doğrulanan IP, curl'e ``CURLOPT_RESOLVE`` ile sabitlenir; böylece kontrol ile
-  bağlantı arasında DNS yeniden bağlama (rebinding) yapılamaz.
+  bağlantı arasında DNS yeniden bağlama (rebinding) yapılamaz. curl'e özgün URL
+  değil, ana makine kısmı tam olarak denetlenen adla yeniden kurulmuş URL verilir
+  (``host.`` / büyük harf / IDN / sayısal IP yazımları sabitlemeyi atlatamaz).
 * Yönlendirmeler curl'e bırakılmaz; her adım elle izlenir ve yeniden doğrulanır.
 * Yanıttan sonra curl'ün gerçekte bağlandığı IP (``primary_ip``) bir kez daha
   denetlenir (proxy yoksa).
@@ -25,7 +27,7 @@ import ipaddress
 import socket
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-from urllib.parse import SplitResult, urljoin, urlsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from curl_cffi import CurlOpt
 from curl_cffi import requests as curl_requests
@@ -67,10 +69,13 @@ class HostResolutionError(curl_exc.DNSError):
 @dataclass(frozen=True)
 class Target:
     url: str
-    host: str          # IDNA ile ASCII'ye çevrilmiş, küçük harfli ana makine adı
+    host: str          # IDNA ile ASCII'ye çevrilmiş, küçük harfli, sonda noktasız ana makine adı
     port: int
     ip_literal: bool   # host zaten bir IP adresi mi
     pinned_ip: Optional[str]  # curl'e sabitlenecek, doğrulanmış adres
+    # curl'e gerçekten verilen URL: ana makine kısmı tam olarak denetlenen ``host``
+    # (sondaki nokta, büyük harf, IDN, sayısal IP yazımları normalleştirilmiş).
+    request_url: str = ""
 
 
 def _allow_private() -> bool:
@@ -188,6 +193,20 @@ def _check_name(host: str) -> None:
         raise UnsafeURLError(f"iç ağ ana makine adına izin verilmiyor: {host}")
 
 
+def _request_url(parts: SplitResult, host: str) -> str:
+    """URL'yi denetlenen ana makine adıyla yeniden kur.
+
+    curl ana makine adını kendi ayrıştırır; ``example.com.`` gibi bir yazım
+    ``CURLOPT_RESOLVE`` kaydıyla (``example.com``) eşleşmezse adı kendisi yeniden
+    çözer ve sabitleme boşa çıkar. Bu yüzden curl'e özgün yazım değil, tam olarak
+    denetlenen ad verilir. Parça (``#...``) zaten sunucuya gitmez, atılır.
+    """
+    netloc = f"[{host}]" if ":" in host else host
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme.lower(), netloc, parts.path or "/", parts.query, ""))
+
+
 def check_url(url: Any, *, resolve: bool = True) -> Target:
     """URL'yi politikaya göre doğrula.
 
@@ -197,18 +216,19 @@ def check_url(url: Any, *, resolve: bool = True) -> Target:
     parts = _split(url)
     host, literal = _normalize_host(parts)
     port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    req_url = _request_url(parts, host)
 
     if _allow_private():
-        return Target(url=url, host=host, port=port, ip_literal=literal, pinned_ip=None)
+        return Target(url=url, host=host, port=port, ip_literal=literal, pinned_ip=None, request_url=req_url)
 
     if literal:
         if not is_public_ip(host):
             raise UnsafeURLError(f"iç/özel ağ adresine izin verilmiyor: {host}")
-        return Target(url=url, host=host, port=port, ip_literal=True, pinned_ip=host)
+        return Target(url=url, host=host, port=port, ip_literal=True, pinned_ip=host, request_url=req_url)
 
     _check_name(host)
     if not resolve:
-        return Target(url=url, host=host, port=port, ip_literal=False, pinned_ip=None)
+        return Target(url=url, host=host, port=port, ip_literal=False, pinned_ip=None, request_url=req_url)
 
     try:
         addrs = _resolve(host, port)
@@ -219,7 +239,7 @@ def check_url(url: Any, *, resolve: bool = True) -> Target:
     bad = [a for a in addrs if not is_public_ip(a)]
     if bad:
         raise UnsafeURLError(f"{host} iç/özel ağ adresine çözülüyor: {bad[0]}")
-    return Target(url=url, host=host, port=port, ip_literal=False, pinned_ip=addrs[0])
+    return Target(url=url, host=host, port=port, ip_literal=False, pinned_ip=addrs[0], request_url=req_url)
 
 
 def check_api_url(url: Any) -> str:
@@ -264,7 +284,7 @@ def guarded_request(
         target = check_url(current_url, resolve=True)
         resp = send(
             current_method,
-            current_url,
+            target.request_url,
             proxies=proxies,
             allow_redirects=False,
             curl_options=_pin_options(target, using_proxy),
