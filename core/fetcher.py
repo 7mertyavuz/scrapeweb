@@ -6,7 +6,7 @@ import time
 import urllib.robotparser as robotparser
 from functools import lru_cache
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urlsplit
 
 from curl_cffi import requests
 
@@ -16,24 +16,42 @@ from core.netguard import UnsafeURLError, guarded_request
 
 logger = get_logger(__name__)
 
-@lru_cache(maxsize=1)
-def _robot_parser() -> robotparser.RobotFileParser:
-    rp = robotparser.RobotFileParser()
-    robots_url = urljoin(settings.base_url, "/robots.txt")
-    try:
-        rp.set_url(robots_url)
-        rp.read()
-    except Exception:
-        pass
+@lru_cache(maxsize=256)
+def _robot_parser(origin: str) -> robotparser.RobotFileParser:
+    """`origin` (scheme://host[:port]) için robots.txt'i çek ve ayrıştır.
+
+    İstek, sayfa istekleri gibi netguard üzerinden gider (SSRF koruması).
+    Kurallar urllib.robotparser ile aynı: 401/403 -> her şey yasak, diğer 4xx ->
+    her şey serbest. 5xx ya da ağ hatası istisna fırlatır; lru_cache istisnaları
+    önbelleğe almadığından bir sonraki çağrıda yeniden denenir.
+    """
+    resp = guarded_request(
+        "GET", origin + "/robots.txt", impersonate="chrome120", timeout=settings.request_timeout
+    )
+    rp = robotparser.RobotFileParser(origin + "/robots.txt")
+    if resp.status_code in (401, 403):
+        rp.disallow_all = True
+    elif 400 <= resp.status_code < 500:
+        rp.allow_all = True
+    elif resp.status_code == 200:
+        rp.parse(resp.text.splitlines())
+    else:
+        raise RuntimeError(f"robots.txt alınamadı: HTTP {resp.status_code}")
     return rp
 
 def allowed_by_robots(url: str) -> bool:
+    """URL'nin KENDİ alan adının robots.txt kurallarına göre izinli mi?"""
     if not settings.respect_robots:
         return True
+    parts = urlsplit(url)
     try:
-        return _robot_parser().can_fetch("*", url) # Stealth için wildcard
-    except Exception:
+        rp = _robot_parser(f"{parts.scheme}://{parts.netloc}".lower())
+    except Exception as exc:
+        # Okunamayan robots.txt kazımayı kalıcı olarak durdurmasın (önbelleğe girmez).
+        # İç/özel adres ise sayfa isteği de netguard'da durur.
+        logger.warning("[robots] okunamadı, izinli sayılıyor: %s (%r)", url, exc)
         return True
+    return rp.can_fetch("*", url) # Stealth için wildcard
 
 class Fetcher:
     def get(self, url: str) -> Optional[str]:
@@ -53,6 +71,15 @@ class Fetcher:
             waterfall_tiers.append((settings.proxy_tier_2, "safari15_3"))
 
         current_tier_idx = 0
+        last_status: Optional[int] = None
+
+        def backoff(attempt: int, reason: str) -> None:
+            # Son denemeden sonra beklemek boşa zaman: döngü zaten bitiyor.
+            if attempt >= settings.max_retries:
+                return
+            wait = delay * (2 ** attempt)
+            logger.warning("[retry %d/%d] %s -> %.1fs bekleniyor", attempt, settings.max_retries, reason, wait)
+            time.sleep(wait)
 
         for attempt in range(1, settings.max_retries + 1):
             current_proxy, impersonate_browser = waterfall_tiers[current_tier_idx]
@@ -73,6 +100,7 @@ class Fetcher:
                 if resp.status_code == 200:
                     return resp.text
 
+                last_status = resp.status_code
                 # WAF Engeliyse proxy yükselt (403/429/503)
                 if resp.status_code in (403, 429, 503):
                     logger.warning("[WAF Block] %s %s", resp.status_code, url)
@@ -80,14 +108,15 @@ class Fetcher:
                         current_tier_idx += 1
                         logger.info("Proxy seviyesi artırıldı -> Tier %d", current_tier_idx)
                     else:
-                        wait = delay * (2 ** attempt)
-                        logger.warning("Tüm proxyler banlandı, %.1fs bekleniyor...", wait)
-                        time.sleep(wait)
+                        backoff(attempt, "Tüm proxyler banlandı")
                     continue
 
                 if 400 <= resp.status_code < 500:
                     logger.warning("[skip] %s %s", resp.status_code, url)
                     return None
+
+                # 5xx (503 dışı) ve beklenmeyen kodlar: sunucu sorunu, geri çekilip yeniden dene.
+                backoff(attempt, f"HTTP {resp.status_code} {url}")
 
             except UnsafeURLError as e:
                 # Politika ihlali kalıcıdır: yeniden deneme ya da proxy yükseltme yok.
@@ -100,12 +129,12 @@ class Fetcher:
                     current_tier_idx += 1
                     logger.info("Proxy Bağlantı Hatası -> Tier %d geçiliyor", current_tier_idx)
                 else:
-                    wait = delay * (2 ** attempt)
-                    logger.warning("[retry %d/%d] Ağ Hatası -> %.1fs", attempt, settings.max_retries, wait)
-                    time.sleep(wait)
+                    backoff(attempt, "Ağ Hatası")
 
         if last_err:
             logger.error("[fail] %s: %r", url, last_err)
+        elif last_status is not None:
+            logger.error("[fail] %s: HTTP %s", url, last_status)
         return None
 
     def close(self) -> None:
