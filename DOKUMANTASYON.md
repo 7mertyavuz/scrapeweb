@@ -97,7 +97,8 @@ Diyelim `POST /scrape {"max_pages": 5, "chunk_size": 10}` gönderdin. Adım adı
    - **Parse:** HTML'den `Book` objesi çıkar (JSON-LD → CSS → regex fallback zinciriyle).
    - **Store:** Veritabanına yaz (URL'e göre upsert: varsa güncelle, yoksa ekle).
 5. Sen bu sırada `GET /status/{task_id}` ile durumu, `GET /stats` ile DB'deki kitap
-   sayısını sorgulayabilirsin. `http://localhost:5555` (Flower) ile worker'ları canlı izlersin.
+   sayısını sorgulayabilirsin (ikisi de varsayılanda `X-API-Key` ister). `http://localhost:5555`
+   (Flower) ile worker'ları canlı izlersin.
 
 ---
 
@@ -117,7 +118,8 @@ ScrapeProjem/
 ├── core/
 │   ├── config.py          # Tüm ayarların tek merkezi (env'den okur, default'ları var)
 │   ├── dedup.py           # Tekilleştirme: Bloom filter + içerik-hash
-│   └── fetcher.py         # Nazik HTTP indirici (retry/backoff/robots/gecikme)
+│   ├── fetcher.py         # Nazik HTTP indirici (retry/backoff/robots/gecikme)
+│   └── netguard.py        # Giden istek koruması (SSRF): URL/IP denetimi, yönlendirme takibi
 ├── parser/
 │   └── extract.py         # HTML -> Pydantic Book (çok kademeli, LLM'siz)
 ├── storage/
@@ -130,9 +132,12 @@ ScrapeProjem/
 │   ├── test_discover.py   # Chunk dağıtımı çalışıyor mu? (eager mod)
 │   ├── test_incremental.py# Domain gecikme + içerik-hash mantığı
 │   ├── test_deadletter.py # Retry tetikleyici + dead-letter yönlendirme
+│   ├── test_netguard.py   # SSRF koruması: iç adres, yönlendirme, webhook, tarayıcı
 │   └── verify_bloom.py    # CANLI RedisBloom doğrulaması (test değil, elle çalıştırılır)
 ├── run_local.py           # Redis/Celery KURMADAN tüm pipeline'ı senkron çalıştırır
-├── requirements.txt       # Python bağımlılıkları
+├── requirements.txt       # Python bağımlılıkları (çalışma zamanı)
+├── requirements-dev.txt   # Test bağımlılıkları (requirements.txt + pytest vb.)
+├── .env.example           # Docker için örnek ortam dosyası (sırlar burada doldurulur)
 ├── Dockerfile             # API/worker imajı
 ├── docker-compose.yml     # redis + postgres + api + worker + flower
 ├── README.md              # Hızlı başlangıç
@@ -150,15 +155,31 @@ sadece `core/dedup.py`'a dokunursun; fetcher'dan habersizdir. Bu, "separation of
 **Dosyalar:** `app/main.py`, `workers/celery_app.py`, `workers/tasks.py`
 
 ### FastAPI (`app/main.py`)
-Dış dünyaya 5 endpoint açar:
+Dış dünyaya açtığı endpoint'ler (`GET /` paneli ve `/static/*` dosyaları hariç):
 
 | Endpoint | Ne yapar |
 |----------|----------|
-| `POST /scrape` | Katalog tarama işini kuyruğa atar (`start_url`, `max_pages`, `chunk_size`) |
+| `POST /scrape` | Katalog tarama işini kuyruğa atar (`start_url`, `max_pages`, `chunk_size`, `webhook_url`) |
+| `POST /scrape-dynamic` | Aynı işi AI / tarayıcı (Playwright) moduyla kuyruğa atar |
 | `POST /scrape-one` | Tek bir URL'i kuyruğa atar |
 | `GET /status/{task_id}` | Bir Celery görevinin durumunu sorgular |
 | `GET /stats` | DB'deki kitap sayısı + dedup backend bilgisi |
+| `GET /books` | DB'deki kitaplar (sayfalı) |
+| `GET /dead-letter` | Dead-letter kuyruğundaki başarısız görevler |
 | `GET /health` | Servis ayakta mı + hedef site + dedup backend |
+| `GET /metrics` | Prometheus metrikleri |
+
+**Kimlik doğrulama:** `POST` uçları her zaman `X-API-Key` başlığı ister. `GET /status`,
+`/stats`, `/books` ve `/dead-letter` da varsayılanda anahtar ister; `PUBLIC_READ=true` bu dört
+okuma ucunu anahtarsız açar. `/`, `/static/*`, `/health` ve `/metrics` açıktır. Eksik ya da
+yanlış anahtar `401` döner. `API_KEY`'in varsayılanı yoktur: ayarlı değilse hiçbir istek kimlik
+doğrulayamaz. Eski sürümlerde belgelerde yayımlanan sabit anahtar açıkça ayarlansa bile reddedilir.
+
+**Girdi sınırları:** `max_pages` 1–`MAX_PAGES_LIMIT` (varsayılan 100), `chunk_size` 1–100.
+`start_url`, `webhook_url` ve `url` en çok 2048 karakter olmalı, yalnız `http`/`https` şemasıyla
+ve iç ağa işaret etmeyen bir ana makineyle (ör. `localhost`, `127.0.0.1`, `10.x`, `169.254.169.254`
+reddedilir) gelmelidir. Uymayan istek `422` döner ve kuyruğa hiç girmez. API bu aşamada DNS
+sorgusu yapmaz; asıl denetim ağa çıkılırken yapılır ([Bölüm 7](#7-katman-34--nazik-indirme)).
 
 Kritik nokta: `/scrape` **işi yapmaz**, sadece **kuyruğa koyar** ve anında döner. Asıl iş
 worker'larda arka planda olur. Bu sayede API binlerce isteği bloke olmadan karşılar.
@@ -237,6 +258,16 @@ gerek yoktur. Onun yerine **sağlam mühendislik**:
 - **Nezaket gecikmesi:** Her istekten sonra biraz bekler. Artık bu gecikme **domain-bazlı**
   ayarlanabilir ([Bölüm 11](#11-domain-bazlı-rate-limit)).
 - **robots.txt kontrolü:** Hedef sitenin izin verdiği path'leri çeker (`respect_robots`).
+- **SSRF koruması (`core/netguard.py`):** Sayfa istekleri `guarded_request` üzerinden gider. Yalnız
+  `http`/`https`; ana makine adı çözülür ve çözülen adreslerden biri bile genel değilse
+  (loopback, özel ağ, link-local/bulut metadata, CGNAT, IPv6 ULA vb.) istek gönderilmez.
+  Doğrulanan IP curl'e sabitlenir (DNS rebinding'e karşı), yönlendirmeler elle izlenip her adım
+  yeniden denetlenir (en çok 5). Politika ihlali kalıcı sayılır: yeniden denenmez, `None` döner.
+  Webhook da aynı denetimden geçer ama yönlendirme izlemez. Tarayıcı/AI modunda
+  (`core/browser.py`) tarayıcının her isteği aynı politikayla süzülür; HTTP yönlendirme adımları
+  Playwright'ta yakalanamadığı için zincir gezinmeden sonra denetlenir ve iç adrese varıldıysa
+  içerik atılır. Proxy kullanılırken IP sabitleme uygulanmaz. `ALLOW_PRIVATE_NETWORKS=true`
+  yerel geliştirme için IP denetimlerini kapatır (şema denetimi kalır).
 
 `get(url)` başarısızsa `None` döndürür; çağıran taraf (görev) buna göre retry/dead-letter
 kararı verir.
@@ -371,7 +402,8 @@ etmeli:
 - Aktif/biten/başarısız görevleri,
 - Worker'ların canlı durumunu, yükünü,
 - Görev başına süreleri ve sonuçları
-canlı izlersin. Docker'sız çalıştırmak için:
+canlı izlersin. Docker'da Flower kullanıcı adı/parola ister (`FLOWER_USER`, varsayılan `admin`;
+`FLOWER_PASSWORD`, `.env`'den) ve yalnız `127.0.0.1`'den erişilebilir. Docker'sız çalıştırmak için:
 ```bash
 celery -A workers.celery_app.celery_app flower --port=5555
 ```
@@ -400,8 +432,13 @@ Teknik detaylar:
 
 - FastAPI `StaticFiles` ile `frontend/` dizini `/static` altında servis edilir.
 - `GET /` isteği `frontend/index.html` dosyasını döndürür.
-- CORS açıktır; frontend ayrı bir domainden de çalışabilir.
+- CORS varsayılanda kapalıdır; panel API ile aynı origin'den servis edildiği için gerekmez.
+  Frontend'i ayrı bir domainden çalıştıracaksan o origin'i `CORS_ORIGINS`'e ekle.
 - API Key, tarayıcının `localStorage`'ında saklanır; sayfa yenilense bile korunur.
+- Anahtar girilmemişse ya da sunucu reddederse (`401`) panel bir uyarı bandı gösterir.
+- Sunucudan gelen veri (kitap adları, hata mesajları vb.) HTML olarak yorumlanmaz, düz metin
+  olarak basılır; bağlantılar yalnız `http`/`https` ise oluşturulur. `index.html` ayrıca
+  satır içi betiği engelleyen bir Content-Security-Policy taşır.
 
 ---
 
@@ -416,16 +453,24 @@ python run_local.py --pages 2
 Çıktıda dedup backend'ini, çekilen kitapları ve toplam sayıyı görürsün; SQLite'a yazar.
 
 ### Mod 2 — Tam dağıtık (Docker)
+Önce `.env` dosyasını oluşturup zorunlu sırları doldur: `API_KEY`, `REDIS_PASSWORD`,
+`POSTGRES_PASSWORD`, `BROWSERLESS_TOKEN`, `FLOWER_PASSWORD`. Parolalar bağlantı URL'lerine
+yazıldığı için yalnız harf/rakam kullan (`secrets.token_hex` çıktısı uygundur). Biri eksikse
+`docker compose` hangisinin eksik olduğunu söyleyip durur.
 ```bash
+cp .env.example .env      # Windows: copy .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"   # her sır için bir değer
 docker compose up --build
 ```
-Sonra:
+Sonra (`$API_KEY` = `.env`'e yazdığın değer):
 ```bash
 curl -X POST localhost:8000/scrape -H "Content-Type: application/json" \
-     -d '{"max_pages": 5, "chunk_size": 10}'
-curl localhost:8000/stats
-# Flower: http://localhost:5555
+     -H "X-API-Key: $API_KEY" -d '{"max_pages": 5, "chunk_size": 10}'
+curl -H "X-API-Key: $API_KEY" localhost:8000/stats
+# Flower: http://localhost:5555 (FLOWER_USER / FLOWER_PASSWORD)
 ```
+Tüm portlar yalnız `127.0.0.1`'e bağlıdır. API'yi ağdaki başka makinelere açmak için `.env`
+içinde `API_BIND_ADDR=0.0.0.0` yap.
 
 ### Mod 3 — Manuel dağıtık (Docker olmadan, ayrı terminaller)
 ```bash
@@ -434,18 +479,25 @@ celery -A workers.celery_app.celery_app worker --loglevel=info --concurrency=4  
 uvicorn app.main:app --reload                                                      # 3) API
 celery -A workers.celery_app.celery_app flower --port=5555                         # 4) (ops.) Flower
 ```
+API'yi başlatmadan önce `API_KEY` ortam değişkenini ayarla; yoksa korumalı uçlar her isteği
+`401` ile reddeder.
 
 ---
 
 ## 17. Test stratejisi
 
 ```bash
+pip install -r requirements-dev.txt
 pytest -q
 ```
 
-`tests/conftest.py` testleri **izole** eder: gerçek `scrapehub.db` yerine **geçici** bir
-SQLite dosyası kullanır ve dedup'ı **memory** backend'ine zorlar (gerçek Redis gerektirmez).
-Her test öncesi tablolar sıfırlanır.
+`requirements-dev.txt`, `requirements.txt`'in üstüne test araçlarını ekler; uygulamayı
+çalıştırmak için `requirements.txt` yeterlidir.
+
+`tests/conftest.py` testleri **izole** eder: `DATABASE_URL`'deki PostgreSQL'i kullanır (varsayılan
+`postgresql+psycopg2://scrape:scrape@localhost:5432/scrapehub`), dedup'ı **memory** backend'ine
+zorlar (gerçek Redis gerektirmez) ve güvenlik ayarlarını varsayılana çekip teste özgü bir
+`API_KEY` verir. Her test öncesi tablolar sıfırlanır.
 
 | Test dosyası | Neyi kanıtlar |
 |--------------|---------------|
@@ -455,7 +507,8 @@ Her test öncesi tablolar sıfırlanır.
 | `test_discover.py` | Chunk dağıtımı (eager mod): 5 kitap → 3 chunk → hepsi DB'de; per-url fallback |
 | `test_incremental.py` | Domain-bazlı gecikme + `content_changed` (yeni→aynı→değişti) |
 | `test_deadletter.py` | Fetch hatası `FetchError` fırlatır; `on_failure` dead-letter'a yazar |
-| `test_main.py` | API endpoint'leri (frontend, stats, books, health, metrics, yetkilendirme) |
+| `test_main.py` | API endpoint'leri (frontend, stats, books, health, metrics, yetkilendirme, girdi sınırları, iç ağ URL'lerinin reddi, CORS) |
+| `test_netguard.py` | SSRF koruması: IP sınıflandırma, iç adrese yönlendirme, webhook, tarayıcı yolu |
 
 Ayrıca `tests/verify_bloom.py` (test değil, elle çalıştırılır): **canlı** bir Redis Stack'e
 karşı `backend == "redis-bloom"` ve `BF.ADD/EXISTS` davranışını kanıtlar:
@@ -468,7 +521,8 @@ REDIS_URL=redis://localhost:6379/0 python tests/verify_bloom.py
 ## 18. Konfigürasyon
 
 Tüm ayarlar `core/config.py`'da toplanır; her biri bir env değişkeninden okunur ve makul bir
-default'a sahiptir (hiçbir şey ayarlamadan çalışır).
+default'a sahiptir. Tek istisna `API_KEY`: varsayılanı yoktur; `run_local.py` ve worker onsuz
+çalışır ama API'nin korumalı uçları onsuz her isteği `401` ile reddeder.
 
 | Değişken | Default | Açıklama |
 |----------|---------|----------|
@@ -486,8 +540,18 @@ default'a sahiptir (hiçbir şey ayarlamadan çalışır).
 | `BLOOM_ERROR_RATE` | `0.001` | Bloom yanlış-pozitif oranı |
 | `INCREMENTAL` | `false` | `true` → içerik değiştiyse yeniden işle |
 | `CONTENT_HASH_TTL` | `604800` | Incremental içerik hash saklama süresi (sn) |
+| `API_KEY` | (yok, zorunlu) | `X-API-Key` ile karşılaştırılan anahtar; boşsa korumalı uçlar `401` |
+| `PUBLIC_READ` | `false` | `true` → `GET /status`, `/stats`, `/books`, `/dead-letter` anahtarsız |
+| `CORS_ORIGINS` | (boş) | Virgülle ayrılmış izinli origin'ler; boş = çapraz origin kapalı |
+| `ALLOW_PRIVATE_NETWORKS` | `false` | `true` → iç/özel ağ hedeflerine izin (yalnız yerel geliştirme) |
+| `MAX_PAGES_LIMIT` | `100` | API'nin kabul ettiği en büyük `max_pages` |
 
-`POST /scrape` gövdesi: `start_url`, `max_pages`, `chunk_size`.
+Docker Compose ayrıca `.env`'den `REDIS_PASSWORD`, `POSTGRES_PASSWORD`, `BROWSERLESS_TOKEN`,
+`FLOWER_PASSWORD` (zorunlu), `POSTGRES_USER`, `POSTGRES_DB`, `FLOWER_USER` ve `API_BIND_ADDR`
+(varsayılan `127.0.0.1`) okur; ayrıntı `.env.example`'da.
+
+`POST /scrape` gövdesi: `start_url`, `max_pages` (1–`MAX_PAGES_LIMIT`), `chunk_size` (1–100),
+`webhook_url`.
 
 ---
 

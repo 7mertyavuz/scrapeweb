@@ -47,36 +47,40 @@ python run_local.py --pages 2
 
 ### Option B — Full distributed mode (Docker)
 
+First create `.env` and fill in the required secrets (`API_KEY`, `REDIS_PASSWORD`, `POSTGRES_PASSWORD`, `BROWSERLESS_TOKEN`, `FLOWER_PASSWORD`). Use letters and digits only for the passwords: they are embedded in connection URLs. `docker compose` stops with an error if one is missing.
+
 ```bash
+cp .env.example .env      # Windows: copy .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"   # one random value per secret
 docker compose up --build
 ```
 
-Then start a scrape:
+Then start a scrape (`$API_KEY` is the value you put in `.env`):
 
 ```bash
 curl -X POST http://localhost:8000/scrape \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: BENIM_GIZLI_SIFREM_123" \
+  -H "X-API-Key: $API_KEY" \
   -d '{"max_pages": 5, "chunk_size": 10}'
 ```
 
 Check progress:
 
 ```bash
-curl http://localhost:8000/stats
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/stats
 curl http://localhost:8000/health
 ```
 
 Open the dashboard:
 
-- **Web UI:** http://localhost:8000
-- **Flower:** http://localhost:5555
+- **Web UI:** http://localhost:8000 (enter the API key in the sidebar)
+- **Flower:** http://localhost:5555 (login: `FLOWER_USER`, default `admin` / `FLOWER_PASSWORD`)
 - **Metrics:** http://localhost:8000/metrics
 - **Jaeger:** http://localhost:16686
 
 ## API Endpoints
 
-All `POST` endpoints require the `X-API-Key` header.
+All `POST` endpoints require the `X-API-Key` header. `GET /status/{task_id}`, `/stats`, `/books` and `/dead-letter` require it too, unless `PUBLIC_READ=true`. `/`, `/static/*`, `/health` and `/metrics` are open. A missing or wrong key returns `401`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -91,6 +95,8 @@ All `POST` endpoints require the `X-API-Key` header.
 | `/health` | GET | Deep health check: Redis + PostgreSQL. |
 | `/metrics` | GET | Prometheus metrics endpoint. |
 
+Request limits: `max_pages` is 1–`MAX_PAGES_LIMIT` (default 100), `chunk_size` is 1–100, and `start_url`, `webhook_url` and `url` must be public `http`/`https` URLs of at most 2048 characters. Anything else is rejected with `422`.
+
 ## Configuration
 
 Key environment variables (see `core/config.py` for the full list):
@@ -100,7 +106,11 @@ Key environment variables (see `core/config.py` for the full list):
 | `SCRAPE_BASE_URL` | `https://books.toscrape.com/` | Target site |
 | `REDIS_URL` | `redis://localhost:6379/0` | Broker + Bloom filter |
 | `DATABASE_URL` | `sqlite:///scrapehub.db` | PostgreSQL recommended for production |
-| `API_KEY` | `BENIM_GIZLI_SIFREM_123` | FastAPI endpoint protection |
+| `API_KEY` | — (required) | FastAPI endpoint protection; if unset, every protected request gets `401` |
+| `PUBLIC_READ` | `false` | `true` → `GET` data endpoints readable without a key |
+| `CORS_ORIGINS` | (empty) | Comma-separated allowed origins; empty = cross-origin disabled |
+| `ALLOW_PRIVATE_NETWORKS` | `false` | `true` → allow private/internal targets (local development only) |
+| `MAX_PAGES_LIMIT` | `100` | Largest `max_pages` the API accepts |
 | `REQUEST_DELAY` | `0.5` | Politeness delay between requests |
 | `MAX_CONCURRENCY` | `4` | Worker concurrency base |
 | `MAX_RETRIES` | `3` | Retry attempts for failed fetches |
@@ -112,10 +122,11 @@ Key environment variables (see `core/config.py` for the full list):
 ## Testing
 
 ```bash
+pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Tests are isolated by `tests/conftest.py` using a temporary SQLite database and in-memory deduplication.
+`requirements.txt` is enough to run the app; `requirements-dev.txt` adds the test tools. `tests/conftest.py` points the tests at PostgreSQL (`DATABASE_URL`, default `postgresql+psycopg2://scrape:scrape@localhost:5432/scrapehub`), resets the tables before each test, forces in-memory deduplication, and sets a test-only `API_KEY`.
 
 ## Architecture
 
@@ -157,6 +168,25 @@ Tests are isolated by `tests/conftest.py` using a temporary SQLite database and 
 | `flower` | Celery monitoring UI | `5555` |
 | `browserless` | Headless Chrome for dynamic/AI mode | `3000` |
 | `jaeger` | Distributed tracing UI | `16686` |
+
+All ports are published on `127.0.0.1` only. To expose the API on your network, set `API_BIND_ADDR=0.0.0.0` in `.env`.
+
+## Security
+
+- **API key:** `API_KEY` has no default. Write endpoints and, unless `PUBLIC_READ=true`, the data-reading endpoints require `X-API-Key`; `/`, `/static/*`, `/health` and `/metrics` stay open.
+- **Targets:** scrape targets and `webhook_url` must be public `http`/`https` addresses; loopback, private, link-local (cloud metadata) and similar addresses are refused. Hostnames are resolved and checked before connecting, the checked IP is pinned, and each redirect is re-checked (webhooks do not follow redirects). `ALLOW_PRIVATE_NETWORKS=true` turns the address checks off for local development.
+- **CORS** is off unless `CORS_ORIGINS` lists origins.
+- **Docker defaults:** ports bound to `127.0.0.1`; Redis, Postgres, browserless and Flower require the passwords/token from `.env`; the image runs as a non-root user.
+- **Dashboard:** server data is rendered as text, never as HTML.
+
+Known limitations:
+
+- In the browser/AI mode, redirect hops are not intercepted by Playwright; the chain and final URL are checked after navigation and the content is discarded if it reached an internal address, but the request itself has already been sent.
+- When a proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) is used, IP pinning and the connected-IP check are not applied.
+- There is no rate limiting.
+- `/docs` (OpenAPI UI) is public.
+
+**Upgrading:** older versions documented a fixed default API key. It is now always rejected; if you deployed with it, set a new random `API_KEY`.
 
 ## Ethical & Legal Notice
 

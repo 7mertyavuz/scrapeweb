@@ -47,36 +47,40 @@ python run_local.py --pages 2
 
 ### Seçenek B — Tam dağıtık mod (Docker)
 
+Önce `.env` dosyasını oluşturup zorunlu sırları doldurun (`API_KEY`, `REDIS_PASSWORD`, `POSTGRES_PASSWORD`, `BROWSERLESS_TOKEN`, `FLOWER_PASSWORD`). Parolalarda yalnız harf ve rakam kullanın: bağlantı URL'lerinin içine yazılırlar. Biri eksikse `docker compose` hata verip durur.
+
 ```bash
+cp .env.example .env      # Windows: copy .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"   # her sır için bir rastgele değer
 docker compose up --build
 ```
 
-Ardından bir kazıma işi başlatın:
+Ardından bir kazıma işi başlatın (`$API_KEY`, `.env`'e yazdığınız değerdir):
 
 ```bash
 curl -X POST http://localhost:8000/scrape \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: BENIM_GIZLI_SIFREM_123" \
+  -H "X-API-Key: $API_KEY" \
   -d '{"max_pages": 5, "chunk_size": 10}'
 ```
 
 İlerlemeyi kontrol edin:
 
 ```bash
-curl http://localhost:8000/stats
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/stats
 curl http://localhost:8000/health
 ```
 
 Arayüzleri açın:
 
-- **Web Arayüzü:** http://localhost:8000
-- **Flower:** http://localhost:5555
+- **Web Arayüzü:** http://localhost:8000 (API anahtarını sol menüye girin)
+- **Flower:** http://localhost:5555 (giriş: `FLOWER_USER`, varsayılan `admin` / `FLOWER_PASSWORD`)
 - **Metrikler:** http://localhost:8000/metrics
 - **Jaeger:** http://localhost:16686
 
 ## API Uç Noktaları
 
-Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir.
+Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir. `GET /status/{task_id}`, `/stats`, `/books` ve `/dead-letter` da `PUBLIC_READ=true` değilse anahtar ister. `/`, `/static/*`, `/health` ve `/metrics` açıktır. Eksik ya da yanlış anahtar `401` döner.
 
 | Uç Nokta | Metot | Açıklama |
 |----------|-------|----------|
@@ -91,6 +95,8 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir.
 | `/health` | GET | Derin sağlık kontrolü: Redis + PostgreSQL. |
 | `/metrics` | GET | Prometheus metrik endpoint'i. |
 
+İstek sınırları: `max_pages` 1–`MAX_PAGES_LIMIT` (varsayılan 100), `chunk_size` 1–100 arasıdır; `start_url`, `webhook_url` ve `url` en çok 2048 karakterlik, genel (iç ağ olmayan) `http`/`https` adresleri olmalıdır. Aksi `422` ile reddedilir.
+
 ## Konfigürasyon
 
 Önemli ortam değişkenleri (tam liste için `core/config.py`):
@@ -100,7 +106,11 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir.
 | `SCRAPE_BASE_URL` | `https://books.toscrape.com/` | Hedef site |
 | `REDIS_URL` | `redis://localhost:6379/0` | Broker + Bloom filter |
 | `DATABASE_URL` | `sqlite:///scrapehub.db` | Üretimde PostgreSQL önerilir |
-| `API_KEY` | `BENIM_GIZLI_SIFREM_123` | FastAPI endpoint koruması |
+| `API_KEY` | — (zorunlu) | FastAPI endpoint koruması; ayarlı değilse korumalı her istek `401` alır |
+| `PUBLIC_READ` | `false` | `true` → `GET` veri uçları anahtarsız okunabilir |
+| `CORS_ORIGINS` | (boş) | Virgülle ayrılmış izinli origin'ler; boş = çapraz origin kapalı |
+| `ALLOW_PRIVATE_NETWORKS` | `false` | `true` → özel/iç ağ hedeflerine izin (yalnız yerel geliştirme) |
+| `MAX_PAGES_LIMIT` | `100` | API'nin kabul ettiği en büyük `max_pages` |
 | `REQUEST_DELAY` | `0.5` | İstekler arası nezaket gecikmesi |
 | `MAX_CONCURRENCY` | `4` | Worker eşzamanlılık tabanı |
 | `MAX_RETRIES` | `3` | Başarısız fetch için yeniden deneme |
@@ -112,10 +122,11 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir.
 ## Test
 
 ```bash
+pip install -r requirements-dev.txt
 pytest -q
 ```
 
-`tests/conftest.py` testleri izole eder: geçici SQLite veritabanı ve bellek içi tekilleştirme kullanır.
+Uygulamayı çalıştırmak için `requirements.txt` yeterlidir; `requirements-dev.txt` test araçlarını ekler. `tests/conftest.py` testleri PostgreSQL'e yönlendirir (`DATABASE_URL`, varsayılan `postgresql+psycopg2://scrape:scrape@localhost:5432/scrapehub`), her testten önce tabloları sıfırlar, bellek içi tekilleştirmeyi zorlar ve teste özgü bir `API_KEY` ayarlar.
 
 ## Mimari
 
@@ -157,6 +168,25 @@ pytest -q
 | `flower` | Celery izleme arayüzü | `5555` |
 | `browserless` | Dinamik/AI modu için headless Chrome | `3000` |
 | `jaeger` | Dağıtık izleme arayüzü | `16686` |
+
+Tüm portlar yalnız `127.0.0.1`'e yayınlanır. API'yi ağa açmak için `.env` içinde `API_BIND_ADDR=0.0.0.0` yapın.
+
+## Güvenlik
+
+- **API anahtarı:** `API_KEY`'in varsayılanı yoktur. Yazma uçları ve `PUBLIC_READ=true` değilse veri okuma uçları `X-API-Key` ister; `/`, `/static/*`, `/health` ve `/metrics` açık kalır.
+- **Hedefler:** Kazıma hedefleri ve `webhook_url` yalnız genel `http`/`https` adresleri olabilir; loopback, özel ağ, link-local (bulut metadata) ve benzeri adresler reddedilir. Ana makine adı bağlanmadan önce çözülüp denetlenir, denetlenen IP sabitlenir ve her yönlendirme yeniden denetlenir (webhook yönlendirme izlemez). `ALLOW_PRIVATE_NETWORKS=true` yerel geliştirme için adres denetimlerini kapatır.
+- **CORS**, `CORS_ORIGINS` origin listelemedikçe kapalıdır.
+- **Docker varsayılanları:** Portlar `127.0.0.1`'e bağlı; Redis, Postgres, browserless ve Flower `.env`'deki parola/token'ı ister; imaj root olmayan kullanıcıyla çalışır.
+- **Panel:** Sunucu verisi HTML olarak değil, düz metin olarak basılır.
+
+Bilinen sınırlar:
+
+- Tarayıcı/AI modunda yönlendirme adımları Playwright'ta yakalanamaz; zincir ve son URL gezinmeden sonra denetlenir ve iç adrese varılmışsa içerik atılır, ama istek o sırada gönderilmiş olur.
+- Proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) kullanılırken IP sabitleme ve bağlanılan IP denetimi uygulanmaz.
+- Hız sınırı (rate limiting) yoktur.
+- `/docs` (OpenAPI arayüzü) açıktır.
+
+**Yükseltme:** Eski sürümler belgelerde sabit bir varsayılan API anahtarı yayımlıyordu. Bu anahtar artık her zaman reddedilir; onunla kurulum yaptıysanız yeni, rastgele bir `API_KEY` ayarlayın.
 
 ## Etik & Yasal Uyarı
 
