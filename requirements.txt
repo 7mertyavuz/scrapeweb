@@ -1,22 +1,24 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-celery>=5.3
-redis>=5.0
-beautifulsoup4>=4.12
-pydantic>=2.6
-sqlalchemy>=2.0
-flower>=2.0
-curl_cffi>=0.7.1
-playwright>=1.41.0
-requests>=2.31.0
+# Çalışma zamanı (runtime) bağımlılıkları — Docker imajı yalnız bunu kurar.
+# Test/geliştirme araçları için: pip install -r requirements-dev.txt
+#
+# Alt sınır + bir sonraki ana sürüm tavanı: bir kütüphanenin kırıcı (major)
+# sürümü çıktığında kurulum sessizce bozulmasın diye.
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+celery>=5.3,<6
+redis>=5.0,<9
+beautifulsoup4>=4.12,<5
+pydantic>=2.6,<3
+sqlalchemy>=2.0,<3
+psycopg2-binary>=2.9,<3
+flower>=2.0,<3
+curl_cffi>=0.7.1,<1
+playwright>=1.41.0,<2
+requests>=2.31.0,<3
 
 # OpenTelemetry (Dağıtık İzleme - Jaeger için)
-opentelemetry-api>=1.22.0
-opentelemetry-sdk>=1.22.0
-opentelemetry-exporter-otlp>=1.22.0
-opentelemetry-instrumentation-fastapi>=0.43b0
-opentelemetry-instrumentation-celery>=0.43b0
-
-# Test / Geliştirme:
-pytest>=8.0
-psycopg2-binary>=2.9
+opentelemetry-api>=1.22.0,<2
+opentelemetry-sdk>=1.22.0,<2
+opentelemetry-exporter-otlp>=1.22.0,<2
+opentelemetry-instrumentation-fastapi>=0.43b0,<1
+opentelemetry-instrumentation-celery>=0.43b0,<1
