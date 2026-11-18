@@ -29,7 +29,7 @@ ScrapeHub, bir web sitesini yapılandırılmış veriye dönüştüren ve verita
 - **Mikroservis odaklı:** API, worker'lar, Redis, Postgres ve Flower ayrı servisler olarak çalışır.
 - **Yatay ölçeklenebilir:** Daha fazla Celery worker ekleyerek throughput artırılır.
 - **Dayanıklı fetch:** Üstel backoff, jitter ve domain bazlı nezaket gecikmesiyle yeniden deneme.
-- **Tekilleştirme:** RedisBloom varsa kullanır, yoksa bellek içi fallback'e düşer.
+- **Tekilleştirme:** RedisBloom varsa kullanır, yoksa bellek içi fallback'e düşer. Bir URL ancak kitabı kaydedildikten sonra "görüldü" sayılır ve en az `DEDUP_TTL` (varsayılan 24 sa) öyle kalır; kayıtlar tek tek sona erer.
 - **Artımlı mod:** Sayfa içeriği değiştiğinde yeniden işler.
 - **AI destekli mod:** Browserless Chrome + Ollama LLM ile dinamik kazıma.
 - **Dead-letter kuyruğu:** Başarısız görevler sonradan incelenmek üzere yakalanır.
@@ -91,8 +91,8 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir. `GET /status/{task_
 | `/status/{task_id}` | GET | Celery görev durumu. |
 | `/stats` | GET | Kitap sayısı + tekilleştirme backend bilgisi. |
 | `/books` | GET | Veritabanındaki kitaplar (sayfalı). |
-| `/dead-letter` | GET | İnceleme için yakalanan başarısız görevler. |
-| `/health` | GET | Derin sağlık kontrolü: Redis + PostgreSQL. |
+| `/dead-letter` | GET | İnceleme için yakalanan başarısız görevler, en yeni önce (son 1000 kayıt tutulur). |
+| `/health` | GET | Derin sağlık kontrolü: Redis'e doğrudan ping (kısa zaman aşımı) + PostgreSQL; biri başarısızsa `503`. |
 | `/metrics` | GET | Prometheus metrik endpoint'i. |
 
 İstek sınırları: `max_pages` 1–`MAX_PAGES_LIMIT` (varsayılan 100), `chunk_size` 1–100 arasıdır; `start_url`, `webhook_url` ve `url` en çok 2048 karakterlik, genel (iç ağ olmayan) `http`/`https` adresleri olmalıdır. Aksi `422` ile reddedilir.
@@ -115,6 +115,7 @@ Tüm `POST` uç noktaları `X-API-Key` header'ı gerektirir. `GET /status/{task_
 | `MAX_CONCURRENCY` | `4` | Worker eşzamanlılık tabanı |
 | `MAX_RETRIES` | `3` | Başarısız fetch için yeniden deneme |
 | `INCREMENTAL` | `false` | Sadece içerik değiştiğinde yeniden işle |
+| `DEDUP_TTL` | `86400` | Kaydedilen bir URL'nin "görüldü" kaldığı saniye (Redis ve bellek içi) |
 | `BROWSERLESS_URL` | `ws://localhost:3000` | AI modu için headless Chrome |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Yerel LLM endpoint'i |
 | `JAEGER_ENDPOINT` | `http://localhost:4318/v1/traces` | OpenTelemetry trace'leri |
@@ -174,19 +175,23 @@ Tüm portlar yalnız `127.0.0.1`'e yayınlanır. API'yi ağa açmak için `.env`
 ## Güvenlik
 
 - **API anahtarı:** `API_KEY`'in varsayılanı yoktur. Yazma uçları ve `PUBLIC_READ=true` değilse veri okuma uçları `X-API-Key` ister; `/`, `/static/*`, `/health` ve `/metrics` açık kalır.
-- **Hedefler:** Kazıma hedefleri ve `webhook_url` yalnız genel `http`/`https` adresleri olabilir; loopback, özel ağ, link-local (bulut metadata) ve benzeri adresler reddedilir. Ana makine adı bağlanmadan önce çözülüp denetlenir, denetlenen IP sabitlenir ve her yönlendirme yeniden denetlenir (webhook yönlendirme izlemez). `ALLOW_PRIVATE_NETWORKS=true` yerel geliştirme için adres denetimlerini kapatır.
+- **Hedefler:** Kazıma hedefleri ve `webhook_url` yalnız genel `http`/`https` adresleri olabilir; loopback, özel ağ, link-local (bulut metadata) ve benzeri adresler reddedilir. Ana makine adı bağlanmadan önce çözülüp denetlenir, denetlenen IP sabitlenir (curl'e denetlenen adla yeniden kurulmuş URL verilir; sonda nokta gibi yazımlar sabitlemeyi atlatamaz) ve her yönlendirme yeniden denetlenir (webhook yönlendirme izlemez). `ALLOW_PRIVATE_NETWORKS=true` yerel geliştirme için adres denetimlerini kapatır.
+- **Tarayıcı/AI modu:** Tarayıcı ağa kendisi çıkmaz. Sayfanın her HTTP(S) isteği worker'da aynı denetimle yapılıp tarayıcıya verilir; WebSocket ve diğer doğrudan bağlantılar kapalıdır. Bu yol daha yavaştır ve resim, medya ve yazı tipi yüklemez.
 - **CORS**, `CORS_ORIGINS` origin listelemedikçe kapalıdır.
-- **Docker varsayılanları:** Portlar `127.0.0.1`'e bağlı; Redis, Postgres, browserless ve Flower `.env`'deki parola/token'ı ister; imaj root olmayan kullanıcıyla çalışır.
+- **Docker varsayılanları:** Portlar `127.0.0.1`'e bağlı; Redis, Postgres, browserless ve Flower `.env`'deki parola/token'ı ister; imaj root olmayan kullanıcıyla çalışır. browserless ayrı bir `browser` ağında çalışır; Redis, Postgres, Jaeger ve Flower'a adıyla ulaşamaz.
 - **Panel:** Sunucu verisi HTML olarak değil, düz metin olarak basılır.
 
 Bilinen sınırlar:
 
-- Tarayıcı/AI modunda yönlendirme adımları Playwright'ta yakalanamaz; zincir ve son URL gezinmeden sonra denetlenir ve iç adrese varılmışsa içerik atılır, ama istek o sırada gönderilmiş olur.
+- browserless'ı verilen compose dosyası dışında çalıştırıyorsanız `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]` verin; bu olmadan sayfa WebRTC ile iç adreslere UDP paketi gönderebilir.
+- Tarayıcı/AI modunda DNS rebinding yapı gereği kapalıdır (istekleri worker denetlenen IP'yi sabitleyerek yapar), ancak gerçek bir rebinding DNS sunucusuyla denenmedi.
 - Proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) kullanılırken IP sabitleme ve bağlanılan IP denetimi uygulanmaz.
 - Hız sınırı (rate limiting) yoktur.
 - `/docs` (OpenAPI arayüzü) açıktır.
+- Tarayıcı/AI modunda WebSocket çalışmaz.
+- Docker'da browserless, host'a yayımlanmış portlara IP ile ve `host.docker.internal` üzerinden hâlâ ulaşabilir.
 
-**Yükseltme:** Eski sürümler belgelerde sabit bir varsayılan API anahtarı yayımlıyordu. Bu anahtar artık her zaman reddedilir; onunla kurulum yaptıysanız yeni, rastgele bir `API_KEY` ayarlayın.
+**Yükseltme:** Eski sürümler belgelerde sabit bir varsayılan API anahtarı yayımlıyordu. Bu anahtar artık her zaman reddedilir; onunla kurulum yaptıysanız yeni, rastgele bir `API_KEY` ayarlayın. Eski sürümler tekilleştirmeyi ömürsüz tek bir `scrapehub:seen_urls` anahtarında tutuyordu; yeni kod ona bakmaz, `docker compose exec redis redis-cli DEL scrapehub:seen_urls` ile silebilirsiniz.
 
 ## Etik & Yasal Uyarı
 

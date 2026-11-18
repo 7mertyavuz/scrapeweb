@@ -29,7 +29,7 @@ ScrapeHub is a distributed web scraping pipeline that turns a website into struc
 - **Microservice-oriented:** API, workers, Redis, Postgres, and Flower each run as separate services.
 - **Horizontal scaling:** Add more Celery workers to increase throughput.
 - **Resilient fetching:** Retry with exponential backoff, jitter, and domain-based politeness delays.
-- **Deduplication:** RedisBloom when available, in-memory fallback otherwise.
+- **Deduplication:** RedisBloom when available, in-memory fallback otherwise. A URL counts as seen only after its book is stored, and stays seen for at least `DEDUP_TTL` (default 24 h); entries expire one by one.
 - **Incremental mode:** Re-fetch only when page content changes.
 - **AI agentic mode:** Dynamic scraping via Browserless Chrome + Ollama LLM.
 - **Dead-letter queue:** Failed tasks are captured for later inspection.
@@ -91,8 +91,8 @@ All `POST` endpoints require the `X-API-Key` header. `GET /status/{task_id}`, `/
 | `/status/{task_id}` | GET | Celery task status. |
 | `/stats` | GET | Book count + deduplication backend info. |
 | `/books` | GET | Paginated books from the database. |
-| `/dead-letter` | GET | Failed tasks captured for inspection. |
-| `/health` | GET | Deep health check: Redis + PostgreSQL. |
+| `/dead-letter` | GET | Failed tasks captured for inspection, newest first (the last 1000 are kept). |
+| `/health` | GET | Deep health check: direct Redis ping (short timeout) + PostgreSQL; `503` if either fails. |
 | `/metrics` | GET | Prometheus metrics endpoint. |
 
 Request limits: `max_pages` is 1–`MAX_PAGES_LIMIT` (default 100), `chunk_size` is 1–100, and `start_url`, `webhook_url` and `url` must be public `http`/`https` URLs of at most 2048 characters. Anything else is rejected with `422`.
@@ -115,6 +115,7 @@ Key environment variables (see `core/config.py` for the full list):
 | `MAX_CONCURRENCY` | `4` | Worker concurrency base |
 | `MAX_RETRIES` | `3` | Retry attempts for failed fetches |
 | `INCREMENTAL` | `false` | Only re-process when content changes |
+| `DEDUP_TTL` | `86400` | Seconds a stored URL stays "seen" (Redis and in-memory) |
 | `BROWSERLESS_URL` | `ws://localhost:3000` | Headless Chrome for AI mode |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Local LLM endpoint |
 | `JAEGER_ENDPOINT` | `http://localhost:4318/v1/traces` | OpenTelemetry traces |
@@ -174,19 +175,23 @@ All ports are published on `127.0.0.1` only. To expose the API on your network, 
 ## Security
 
 - **API key:** `API_KEY` has no default. Write endpoints and, unless `PUBLIC_READ=true`, the data-reading endpoints require `X-API-Key`; `/`, `/static/*`, `/health` and `/metrics` stay open.
-- **Targets:** scrape targets and `webhook_url` must be public `http`/`https` addresses; loopback, private, link-local (cloud metadata) and similar addresses are refused. Hostnames are resolved and checked before connecting, the checked IP is pinned, and each redirect is re-checked (webhooks do not follow redirects). `ALLOW_PRIVATE_NETWORKS=true` turns the address checks off for local development.
+- **Targets:** scrape targets and `webhook_url` must be public `http`/`https` addresses; loopback, private, link-local (cloud metadata) and similar addresses are refused. Hostnames are resolved and checked before connecting, the checked IP is pinned (curl gets the URL rebuilt with the checked hostname, so spellings such as a trailing dot cannot bypass the pin), and each redirect is re-checked (webhooks do not follow redirects). `ALLOW_PRIVATE_NETWORKS=true` turns the address checks off for local development.
+- **Browser/AI mode:** the browser does not reach the network itself. Every HTTP(S) request of the page is made by the worker with the same checks and handed to the browser; WebSocket and other direct connections are blocked. This path is slower and does not load images, media or fonts.
 - **CORS** is off unless `CORS_ORIGINS` lists origins.
-- **Docker defaults:** ports bound to `127.0.0.1`; Redis, Postgres, browserless and Flower require the passwords/token from `.env`; the image runs as a non-root user.
+- **Docker defaults:** ports bound to `127.0.0.1`; Redis, Postgres, browserless and Flower require the passwords/token from `.env`; the image runs as a non-root user. browserless runs on a separate `browser` network and cannot reach Redis, Postgres, Jaeger or Flower by name.
 - **Dashboard:** server data is rendered as text, never as HTML.
 
 Known limitations:
 
-- In the browser/AI mode, redirect hops are not intercepted by Playwright; the chain and final URL are checked after navigation and the content is discarded if it reached an internal address, but the request itself has already been sent.
+- If you run browserless outside the provided compose file, pass `DEFAULT_LAUNCH_ARGS=["--webrtc-ip-handling-policy=disable_non_proxied_udp"]`; without it a page can send UDP packets to internal addresses via WebRTC.
+- In the browser/AI mode, DNS rebinding is ruled out by design (requests are made by the worker with the checked IP pinned), but this has not been tested against a real rebinding DNS server.
 - When a proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) is used, IP pinning and the connected-IP check are not applied.
 - There is no rate limiting.
 - `/docs` (OpenAPI UI) is public.
+- WebSocket does not work in the browser/AI mode.
+- In Docker, browserless can still reach ports published on the host, by IP and via `host.docker.internal`.
 
-**Upgrading:** older versions documented a fixed default API key. It is now always rejected; if you deployed with it, set a new random `API_KEY`.
+**Upgrading:** older versions documented a fixed default API key. It is now always rejected; if you deployed with it, set a new random `API_KEY`. Older versions also kept deduplication in a single `scrapehub:seen_urls` key that never expires; the new code ignores it, and you can delete it with `docker compose exec redis redis-cli DEL scrapehub:seen_urls`.
 
 ## Ethical & Legal Notice
 
