@@ -17,6 +17,16 @@ os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://scrape:scrape@local
 # 3) Dedup'ı deterministik tut: ulaşılamaz bir Redis adresi -> memory fallback.
 os.environ["REDIS_URL"] = "redis://127.0.0.1:6399/0"
 
+# 4) Güvenlik ayarlarını geliştiricinin ortamından bağımsız, varsayılan (kapalı) hale getir.
+#    API testleri bu bilinen test anahtarını kullanır; "ayarsız anahtar" senaryoları
+#    settings.api_key'i test içinde boşaltır.
+TEST_API_KEY = "test-api-key-0123456789abcdef"
+os.environ["API_KEY"] = TEST_API_KEY
+os.environ["PUBLIC_READ"] = "false"
+os.environ["CORS_ORIGINS"] = ""
+os.environ["ALLOW_PRIVATE_NETWORKS"] = "false"
+os.environ.pop("MAX_PAGES_LIMIT", None)
+
 import pytest  # noqa: E402
 
 @pytest.fixture(autouse=True)

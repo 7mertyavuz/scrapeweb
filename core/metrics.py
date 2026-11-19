@@ -11,7 +11,7 @@ yoksa in-memory fallback'e düşeriz (tek-process ders/test senaryosu).
 böylece gerçek bir Prometheus sunucusu /metrics'i sorunsuz scrape edebilir.
 """
 from __future__ import annotations
-from typing import Optional
+import json
 
 from core.config import settings
 from core.logging import get_logger
@@ -19,6 +19,9 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 
 _PREFIX = "scrapehub:metrics:"
+
+# Dead-letter listesinde tutulan en fazla kayıt (en yeniler kalır).
+DEAD_LETTER_MAX = 1000
 
 # Lifetime sayaçlar (monoton artan = Prometheus 'counter').
 COUNTERS = ("pages_processed", "failed_fetch")
@@ -76,6 +79,39 @@ class Metrics:
             except Exception:
                 pass
         return 0
+
+    # --- Dead-letter listesi (Redis listesi; en eski başta, en yeni sonda) ---
+    def push_dead_letter(self, payload: dict) -> bool:
+        """Kaydı listeye ekle ve listeyi DEAD_LETTER_MAX ile sınırla.
+
+        Redis yoksa ya da yazılamazsa False döner (çağıran loga düşer).
+        """
+        if self._client is None:
+            return False
+        try:
+            self._client.rpush(self.DEAD_LETTER_KEY, json.dumps(payload, ensure_ascii=False))
+            self._client.ltrim(self.DEAD_LETTER_KEY, -DEAD_LETTER_MAX, -1)
+            return True
+        except Exception as exc:
+            logger.warning("dead-letter yazılamadı: %r", exc)
+            return False
+
+    def dead_letters(self, limit: int) -> list[dict]:
+        """En yeni `limit` kaydı, en yeniden eskiye doğru döndür."""
+        if self._client is None or limit <= 0:
+            return []
+        try:
+            raw_items = self._client.lrange(self.DEAD_LETTER_KEY, -limit, -1)
+        except Exception as exc:
+            logger.warning("dead-letter okunamadı: %r", exc)
+            return []
+        items: list[dict] = []
+        for raw in reversed(raw_items):
+            try:
+                items.append(json.loads(raw))
+            except (TypeError, ValueError):
+                continue
+        return items
 
     def snapshot(self) -> dict[str, int]:
         """Tüm sayaç + gauge'ların anlık değerleri."""

@@ -1,0 +1,13 @@
+# Test / geliştirme bağımlılıkları (runtime'ın üstüne).
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=8.0,<10
+
+# fastapi.testclient (starlette.testclient) bir HTTP istemcisine ihtiyaç duyar:
+#   - eski Starlette sürümleri yalnız `httpx` kullanır,
+#   - yeni Starlette sürümleri `httpx2`'yi tercih eder (`httpx` ile uyarı verir).
+# İkisini birlikte kurmak her FastAPI/Starlette sürümünde çalışır
+# (fastapi[standard] da aynısını yapar).
+httpx>=0.23,<1
+httpx2>=2.0; python_version >= "3.11"

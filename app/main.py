@@ -3,20 +3,23 @@ Katman 1: API Gateway (FastAPI).
 OpenTelemetry, yeni AI uç noktaları ve web arayüzü ile güncellendi.
 """
 from __future__ import annotations
+import hmac
 from contextlib import suppress
 from pathlib import Path
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from core.config import settings
 from core.dedup import dedup
 from core.logging import get_logger
 from core.metrics import metrics
+from core.netguard import MAX_URL_LENGTH, UnsafeURLError, check_api_url
 from storage.db import count_books, get_books, init_db, ping_db
 
 # Sisteme doğrudan ana Celery uygulamamızı tanıtıyoruz
@@ -30,20 +33,40 @@ logger = get_logger(__name__)
 
 app = FastAPI(title="ScrapeHub AI", version="2.1", description="Otonom Web Scraping Pipeline")
 
-# CORS: frontend (yerel geliştirme veya farklı domain) API'ye erişebilsin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def install_cors(target: FastAPI, origins: list[str]) -> bool:
+    """CORS'u yalnız açıkça izin verilen origin'ler için aç.
+
+    Ön yüz API ile aynı origin'den servis edildiği için varsayılanda (liste boş)
+    CORS middleware hiç eklenmez. Kimlik doğrulama çerez değil X-API-Key başlığı
+    olduğundan kimlik bilgisi (credentials) hiçbir zaman izinli değildir.
+    """
+    if not origins:
+        return False
+    if "*" in origins:
+        logger.warning("CORS_ORIGINS='*': her origin API'yi çağırabilir (kimlik bilgisi yine kapalı).")
+    target.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
+    return True
+
+
+install_cors(app, settings.cors_origins)
 
 FastAPIInstrumentor.instrument_app(app)
 
 init_db()
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+if not settings.api_key_configured:
+    logger.warning(
+        "API_KEY ayarlı değil (ya da herkesçe bilinen eski varsayılan): "
+        "anahtar gerektiren uçlar tüm istekleri 401 ile reddedecek."
+    )
 
 # Frontend dosyalarını servis et
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -51,22 +74,55 @@ if FRONTEND_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
-def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != settings.api_key:
-        raise HTTPException(status_code=403, detail="Geçersiz yetki")
+def _unauthorized() -> HTTPException:
+    return HTTPException(status_code=401, detail="Geçersiz yetki", headers={"WWW-Authenticate": "ApiKey"})
+
+
+def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> str:
+    # Anahtar ayarlı değilse hiçbir istek kimlik doğrulayamaz (boş == boş eşleşmesi dahil).
+    if not settings.api_key_configured or not api_key:
+        raise _unauthorized()
+    if not hmac.compare_digest(api_key.encode("utf-8"), settings.api_key.encode("utf-8")):
+        raise _unauthorized()
     return api_key
 
 
+def verify_read_access(api_key: Optional[str] = Security(api_key_header)) -> Optional[str]:
+    """Okuma uçları: PUBLIC_READ=true ise anahtarsız, değilse anahtar zorunlu."""
+    if settings.public_read:
+        return api_key
+    return verify_api_key(api_key)
+
+
+def _validate_target_url(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return check_api_url(value)
+    except UnsafeURLError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 class ScrapeRequest(BaseModel):
-    start_url: str | None = None
-    max_pages: int = 5
-    chunk_size: int = 10
-    webhook_url: str | None = None
+    start_url: str | None = Field(default=None, max_length=MAX_URL_LENGTH)
+    max_pages: int = Field(default=5, ge=1, le=settings.max_pages_limit)
+    chunk_size: int = Field(default=10, ge=1, le=100)
+    webhook_url: str | None = Field(default=None, max_length=MAX_URL_LENGTH)
+
+    @field_validator("start_url", "webhook_url")
+    @classmethod
+    def _check_urls(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_target_url(value)
 
 
 class ScrapeOneRequest(BaseModel):
-    url: str
+    url: str = Field(max_length=MAX_URL_LENGTH)
     force: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return _validate_target_url(value)
 
 
 @app.get("/")
@@ -118,7 +174,7 @@ def scrape_single(req: ScrapeOneRequest, api_key: str = Depends(verify_api_key))
 
 
 @app.get("/status/{task_id}")
-def status(task_id: str) -> dict:
+def status(task_id: str, _auth: Optional[str] = Depends(verify_read_access)) -> dict:
     res = celery_app.AsyncResult(task_id)
     info: dict = {"task_id": task_id, "state": res.state}
     if res.ready():
@@ -128,7 +184,7 @@ def status(task_id: str) -> dict:
 
 
 @app.get("/stats")
-def stats() -> dict:
+def stats(_auth: Optional[str] = Depends(verify_read_access)) -> dict:
     return {"books_in_db": count_books(), "dedup_backend": dedup.backend}
 
 
@@ -136,6 +192,7 @@ def stats() -> dict:
 def list_books(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    _auth: Optional[str] = Depends(verify_read_access),
 ) -> dict:
     """Veritabanındaki kitapları sayfalayarak döndür."""
     books, total = get_books(limit=limit, offset=offset)
@@ -148,40 +205,40 @@ def list_books(
 
 
 @app.get("/dead-letter")
-def list_dead_letter(limit: int = Query(100, ge=1, le=1000)) -> dict:
-    """Son başarısız görevleri (dead-letter kuyruğu) döndür."""
-    items: list[dict] = []
-    client = getattr(dedup, "_client", None)
-    if client:
-        try:
-            raw_items = client.lrange("scrapehub:dead_letter", 0, limit - 1)
-            import json
-            for raw in raw_items:
-                with suppress(Exception):
-                    items.append(json.loads(raw))
-        except Exception as exc:
-            logger.warning("dead-letter okunamadı: %r", exc)
+def list_dead_letter(
+    limit: int = Query(100, ge=1, le=1000),
+    _auth: Optional[str] = Depends(verify_read_access),
+) -> dict:
+    """Son başarısız görevleri (dead-letter kuyruğu) en yeniden eskiye döndür."""
+    items = metrics.dead_letters(limit)
     return {"items": items, "count": len(items)}
+
+
+def _redis_ok() -> bool:
+    """Redis'e (broker + dedup + metrikler) kısa zaman aşımlı doğrudan PING.
+
+    Her çağrıda yeni bağlantı: Redis sonradan ayağa kalkarsa da doğru sonuç verir.
+    """
+    try:
+        import redis  # type: ignore
+
+        client = redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            return bool(client.ping())
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.debug("redis health check hatası: %r", exc)
+        return False
 
 
 @app.get("/health")
 def health() -> dict:
     """Derin health-check: Redis ve PostgreSQL erişilebilirliğini kontrol et."""
     checks = {
-        "redis": False,
+        "redis": _redis_ok(),
         "database": False,
     }
-    try:
-        from celery.app.control import Control
-        ctrl = Control(celery_app)
-        checks["redis"] = ctrl.ping() is not None
-    except Exception as exc:
-        logger.debug("redis health check hatası: %r", exc)
-        # Broker'a direkt ping deneyelim
-        try:
-            checks["redis"] = celery_app.connection().heartbeat_check()
-        except Exception:
-            checks["redis"] = False
 
     try:
         checks["database"] = ping_db()

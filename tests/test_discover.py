@@ -52,14 +52,22 @@ def _fake_get(url: str):
 
 @pytest.fixture
 def eager(monkeypatch):
-    monkeypatch.setattr(celery_app.conf, "task_always_eager", True)
-    monkeypatch.setattr(celery_app.conf, "task_eager_propagates", True)
+    # Celery ayarları elle kurulup geri alınır: pytest 9.2'de monkeypatch.setattr
+    # eski değeri nesnenin __dict__'inden okur; Celery'nin Settings nesnesinde
+    # bulamayınca teardown'da delattr'a düşüp AttributeError verir.
+    conf = celery_app.conf
+    old = {k: conf[k] for k in ("task_always_eager", "task_eager_propagates")}
+    conf.update(task_always_eager=True, task_eager_propagates=True)
     # fetcher'ı her iki referans noktasında da yamala.
     monkeypatch.setattr(tasks.fetcher, "get", _fake_get)
     # Her test taze dedup kullansın (global'i kirletme).
     monkeypatch.setattr(dedup_mod, "dedup", Deduplicator())
     monkeypatch.setattr(tasks, "dedup", dedup_mod.dedup)
-    yield
+    monkeypatch.setattr(tasks.settings, "incremental", False)
+    try:
+        yield
+    finally:
+        conf.update(old)
 
 
 def test_chunked_dispatch_processes_all_books(eager):
@@ -76,3 +84,241 @@ def test_backward_compatible_per_url(eager):
     assert res["mode"] == "per_url"      # chunk_size<=1 -> eski davranış
     assert res["books_dispatched"] == 5
     assert count_books() == 5
+
+
+# --------------------------------------------------------------------------
+# Chunk modu: bir URL'nin hatası chunk'ın kalanını düşürmemeli; webhook sayımı
+# --------------------------------------------------------------------------
+def _failing_for(n: str):
+    def get(url: str):
+        return None if f"book-{n}." in url else _fake_get(url)
+    return get
+
+
+@pytest.fixture
+def requeued(monkeypatch):
+    """Chunk içinde başarısız olan URL'nin tekil görev olarak kuyruğa atılışını yakala."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(tasks.scrape_book, "delay", lambda *a, **k: calls.append((a, k)))
+    return calls
+
+
+@pytest.fixture
+def webhook_sent(monkeypatch):
+    sent: list[dict] = []
+
+    def fake_request(method, url, json=None, **kwargs):
+        sent.append({"method": method, "url": url, "json": json})
+
+    monkeypatch.setattr(tasks, "guarded_request", fake_request)
+    return sent
+
+
+def test_chunk_failure_does_not_drop_rest_of_chunk(eager, monkeypatch, requeued):
+    monkeypatch.setattr(tasks.fetcher, "get", _failing_for("2"))
+    res = tasks.discover_catalog.apply(args=[None, 1, 2]).get()
+
+    assert res["mode"] == "chunked"
+    assert count_books() == 4                     # 1,3,4,5: aynı chunk'taki 1 dahil
+    failed = "https://books.toscrape.com/catalogue/book-2.html"
+    # Başarısız URL tekil scrape_book görevi olarak yeniden kuyruğa girer
+    # (autoretry + dead-letter oradan gelir).
+    assert requeued == [((failed,), {"force": False, "use_ai": False})]
+
+
+def test_chord_webhook_counts_books_not_chunks(eager, webhook_sent):
+    res = tasks.discover_catalog.apply(
+        args=[None, 1, 2], kwargs={"webhook_url": "https://hooks.example/done"}
+    ).get()
+    assert res["webhook_attached"] is True
+    assert len(webhook_sent) == 1
+    body = webhook_sent[0]["json"]
+    assert body["event"] == "scraping_completed"
+    assert body["total_processed"] == 5           # 3 chunk değil, 5 kitap
+    assert body["successful_inserts"] == 5
+    assert body["meta"]["books_dispatched"] == 5
+
+
+def test_chord_webhook_fires_when_a_url_fails(eager, monkeypatch, requeued, webhook_sent):
+    monkeypatch.setattr(tasks.fetcher, "get", _failing_for("2"))
+    tasks.discover_catalog.apply(
+        args=[None, 1, 2], kwargs={"webhook_url": "https://hooks.example/done"}
+    ).get()
+    assert len(webhook_sent) == 1, "chord geri çağrısı tetiklenmeli"
+    body = webhook_sent[0]["json"]
+    assert body["total_processed"] == 5
+    assert body["successful_inserts"] == 4
+    assert body["requeued"] == 1
+
+
+# --------------------------------------------------------------------------
+# Webhook istenmişse koşu HER durumda tek bir webhook ile biter
+# (katalogdan URL çıkmasa da, per-URL modunda da).
+# --------------------------------------------------------------------------
+HOOK = "https://hooks.example/done"
+
+
+@pytest.mark.parametrize("chunk_size", [10, 1], ids=["chunked", "per_url"])
+def test_webhook_fires_when_catalog_yields_no_urls(eager, monkeypatch, webhook_sent, chunk_size):
+    """Başlangıç sayfası 404 / ağ hatası / robots engeli: fetcher.get None döner."""
+    monkeypatch.setattr(tasks.fetcher, "get", lambda url: None)
+    res = tasks.discover_catalog.apply(
+        args=[None, 3, chunk_size], kwargs={"webhook_url": HOOK}
+    ).get()
+    assert len(webhook_sent) == 1
+    assert res["pages_scanned"] == 0 and res["books_dispatched"] == 0
+    assert res["webhook_attached"] is True
+    body = webhook_sent[0]["json"]
+    assert webhook_sent[0]["url"] == HOOK
+    assert body["event"] == "scraping_completed"
+    assert (body["total_processed"], body["successful_inserts"], body["requeued"]) == (0, 0, 0)
+    assert body["meta"]["pages_scanned"] == 0
+
+
+def test_no_webhook_when_not_requested_and_no_urls(eager, monkeypatch, webhook_sent):
+    monkeypatch.setattr(tasks.fetcher, "get", lambda url: None)
+    res = tasks.discover_catalog.apply(args=[None, 3, 10]).get()
+    assert res["books_dispatched"] == 0
+    assert webhook_sent == []
+
+
+def test_per_url_mode_fires_one_webhook(eager, webhook_sent):
+    res = tasks.discover_catalog.apply(args=[None, 1, 1], kwargs={"webhook_url": HOOK}).get()
+    assert count_books() == 5
+    assert len(webhook_sent) == 1
+    assert res["mode"] == "per_url"
+    assert res["webhook_attached"] is True
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"]) == (5, 5)
+    assert body["meta"]["books_dispatched"] == 5
+
+
+def test_per_url_mode_webhook_fires_when_a_url_fails(eager, monkeypatch, requeued, webhook_sent):
+    monkeypatch.setattr(tasks.fetcher, "get", _failing_for("2"))
+    tasks.discover_catalog.apply(args=[None, 1, 1], kwargs={"webhook_url": HOOK}).get()
+    assert len(webhook_sent) == 1
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"], body["requeued"]) == (5, 4, 1)
+    failed = "https://books.toscrape.com/catalogue/book-2.html"
+    assert requeued == [((failed,), {"force": False, "use_ai": False})]
+
+
+# --------------------------------------------------------------------------
+# Hedef sitedeki ayrıştırılamayan bir bağlantı (urljoin ValueError) koşuyu düşürmemeli:
+# bozuk ürün bağlantısı atlanır, bozuk "sonraki sayfa" bağlantısında sayfalama biter.
+# --------------------------------------------------------------------------
+BAD_CATALOG = """
+<html><body>
+  <article class="product_pod"><h3><a href="book-1.html">B1</a></h3></article>
+  <article class="product_pod"><h3><a href="https://[cdn]/b.html">Bozuk</a></h3></article>
+  <article class="product_pod"><h3><a href="book-2.html">B2</a></h3></article>
+  <ul class="pager"><li class="next"><a href="https://[cdn]/page-2.html">next</a></li></ul>
+</body></html>
+"""
+
+
+@pytest.mark.parametrize("chunk_size", [10, 1], ids=["chunked", "per_url"])
+def test_malformed_catalog_links_do_not_fail_run(eager, monkeypatch, webhook_sent, chunk_size):
+    monkeypatch.setattr(
+        tasks.fetcher, "get", lambda url: BAD_CATALOG if "page-" in url else _fake_get(url)
+    )
+    res = tasks.discover_catalog.apply(
+        args=[None, 3, chunk_size], kwargs={"webhook_url": HOOK}
+    ).get()
+    assert res["books_dispatched"] == 2           # bozuk ürün bağlantısı atlandı
+    assert count_books() == 2
+    assert len(webhook_sent) == 1
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"]) == (2, 2)
+    assert body["meta"]["books_dispatched"] == 2
+    assert body["meta"]["pages_scanned"] == 1     # bozuk "sonraki" -> sayfalama biter
+
+
+def test_webhook_callback_flattens_chunk_results(webhook_sent):
+    nested = [
+        [{"status": "ok"}, {"status": "ok"}],
+        [{"status": "updated"}, {"status": "skipped_duplicate"}],
+        [{"status": "requeued"}],
+    ]
+    tasks.webhook_callback.run(nested, "https://hooks.example/done", {"m": 1})
+    body = webhook_sent[0]["json"]
+    assert body["total_processed"] == 5
+    assert body["successful_inserts"] == 3
+    assert body["requeued"] == 1
+    assert body["meta"] == {"m": 1}
+
+
+def test_webhook_callback_accepts_flat_results(webhook_sent):
+    tasks.webhook_callback.run([{"status": "ok"}, {"status": "parse_failed"}], "https://h.example/", {})
+    body = webhook_sent[0]["json"]
+    assert (body["total_processed"], body["successful_inserts"]) == (2, 1)
+
+
+# --------------------------------------------------------------------------
+# "Sonraki sayfa" bağlantısı bir yere götürmüyorsa (href yok/boş/aynı sayfa)
+# sayfalama orada biter; aynı sayfa yeniden çekilip kitaplar tekrar eklenmez.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("next_link", [
+    '<a>next</a>', '<a href="">next</a>', '<a href="#">next</a>', '<a href="page-1.html">next</a>',
+], ids=["no_href", "empty", "fragment", "self"])
+def test_next_link_to_nowhere_ends_pagination(eager, monkeypatch, next_link):
+    catalog = CATALOG.replace("</body>", f'<ul class="pager"><li class="next">{next_link}</li></ul></body>')
+    fetched: list[str] = []
+
+    def get(url):
+        fetched.append(url)
+        return catalog if "page-" in url else _fake_get(url)
+
+    monkeypatch.setattr(tasks.fetcher, "get", get)
+    res = tasks.discover_catalog.apply(args=[None, 5, 1]).get()   # per_url: sonuçta pages_scanned var
+    assert res["pages_scanned"] == 1
+    assert res["books_dispatched"] == 5
+    assert [u for u in fetched if "page-" in u] == ["https://books.toscrape.com/catalogue/page-1.html"]
+
+
+def test_next_page_cycle_is_not_refetched(eager, monkeypatch):
+    """page-1 -> page-2 -> page-1 döngüsünde her sayfa bir kez çekilir."""
+    pages = {
+        "https://books.toscrape.com/catalogue/page-1.html": "page-2.html",
+        "https://books.toscrape.com/catalogue/page-2.html": "page-1.html",
+    }
+    fetched: list[str] = []
+
+    def get(url):
+        fetched.append(url)
+        if url in pages:
+            return CATALOG.replace(
+                "</body>", f'<ul class="pager"><li class="next"><a href="{pages[url]}">n</a></li></ul></body>'
+            )
+        return _fake_get(url)
+
+    monkeypatch.setattr(tasks.fetcher, "get", get)
+    res = tasks.discover_catalog.apply(args=[None, 5, 1]).get()   # per_url: sonuçta pages_scanned var
+    assert res["pages_scanned"] == 2
+    assert [u for u in fetched if "page-" in u] == list(pages)
+
+
+def test_catalog_redirect_to_unparseable_location_does_not_fail_run(eager, monkeypatch, webhook_sent):
+    """Gerçek fetcher + netguard: katalog sayfası ``Location: https://[cdn]/x`` döndürürse
+    görev düşmez, o sayfa çekilemedi sayılır ve webhook yine gider."""
+    import functools
+    import types
+
+    import core.fetcher as fetcher_mod
+    import core.netguard as netguard
+    from core.fetcher import Fetcher
+
+    def send(method, url, **kwargs):
+        return types.SimpleNamespace(
+            status_code=302, headers={"location": "https://[cdn]/x"}, primary_ip="93.184.216.34", text="",
+        )
+
+    monkeypatch.setattr(tasks.fetcher, "get", types.MethodType(Fetcher.get, tasks.fetcher))
+    monkeypatch.setattr(netguard, "_resolve", lambda host, port: ["93.184.216.34"])
+    monkeypatch.setattr(fetcher_mod, "guarded_request", functools.partial(netguard.guarded_request, request_func=send))
+    for name, value in (("respect_robots", False), ("max_retries", 1), ("request_delay_sec", 0.0), ("domain_delays", {})):
+        monkeypatch.setattr(tasks.settings, name, value)
+
+    res = tasks.discover_catalog.apply(args=[None, 3, 10], kwargs={"webhook_url": HOOK}).get()
+    assert res["pages_scanned"] == 0 and res["books_dispatched"] == 0
+    assert len(webhook_sent) == 1

@@ -1,0 +1,47 @@
+# İmaja yalnız uygulamanın çalışması için gereken dosyalar girsin.
+
+# Sürüm kontrolü / CI
+.git
+.gitignore
+.github
+
+# Sırlar ve yerel ayarlar (.env.example zararsız, yine de imajda gereksiz)
+.env
+.env.*
+
+# Sanal ortamlar
+.venv
+venv
+env
+
+# Python çıktıları ve araç önbellekleri
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+
+# Yerel veritabanı ve log dosyaları
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Docker / IDE / OS
+Dockerfile
+docker-compose*.yml
+compose*.yml
+.dockerignore
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Testler ve dokümanlar çalışma zamanında gerekmez
+tests
+*.md

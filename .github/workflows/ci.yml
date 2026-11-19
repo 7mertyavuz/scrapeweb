@@ -1,15 +1,29 @@
 name: CI
 
 on:
+  # main'e push ve PR'lar: PR dalına push zaten pull_request ile test edilir,
+  # böylece aynı commit iki kez koşmaz.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# En az yetki: iş akışı yalnız kodu okur.
+permissions:
+  contents: read
+
+# Aynı dal/PR için yeni bir koşu başlarsa eskisini iptal et.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     # GitHub Actions içinde testler için geçici bir PostgreSQL servisi başlatıyoruz
+    # (iş bitince silinir; buradaki parola yalnız bu geçici veritabanı içindir).
     services:
       postgres:
         image: postgres:16-alpine
@@ -32,21 +46,26 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Run tests
-        # Testler artık GitHub'ın kendi ayağa kaldırdığı PostgreSQL üzerinde çalışacak
+        # Testler GitHub'ın ayağa kaldırdığı PostgreSQL üzerinde çalışır.
+        # API_KEY uygulamada zorunlu; burada yalnız teste özgü sahte bir değer.
         env:
           DATABASE_URL: postgresql+psycopg2://scrape:scrape@localhost:5432/scrapehub
+          API_KEY: ci-test-key
         run: pytest -q

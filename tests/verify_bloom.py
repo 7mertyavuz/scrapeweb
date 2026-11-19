@@ -1,7 +1,7 @@
 """
 Canlı RedisBloom doğrulama scripti (test paketinin parçası değil; elle çalıştırılır).
 
-Amaç: core/dedup.py'ın GERÇEK RedisBloom yoluna (BF.RESERVE / BF.ADD / BF.EXISTS)
+Amaç: core/dedup.py'ın GERÇEK RedisBloom yoluna (BF.INSERT / BF.EXISTS + anahtar ömrü)
 bağlandığını ve mantığın doğru çalıştığını canlı bir Redis Stack'e karşı kanıtlamak.
 
 Kanıtladıkları:
@@ -9,6 +9,9 @@ Kanıtladıkları:
   2. check_and_mark(url): ilk görüşte False (yeni), ikinci görüşte True (görüldü).
   3. Düşük seviye: BF.ADD/BF.EXISTS komutlarını doğrudan çalıştırıp Redis'in
      Bloom modülünü gerçekten tanıdığını gösterir.
+  4. Ömür (DEDUP_TTL=4 ile, ~6 sn sürer): t=0'da A, t=3'te B işaretlenir; B, A'nın
+     filtresiyle birlikte silinmez, en az 4 sn görüldü kalır; sonunda iki kayıt da
+     Redis'ten gerçekten silinir. (Ayrı dilim adları kullanır, gerçek kayıtlara dokunmaz.)
 
 Kullanım:
     # Önce bir Redis Stack ayakta olmalı (docker compose up -d redis  ya da redis-stack-server)
@@ -75,6 +78,12 @@ def main() -> int:
     else:
         print("\n[i] Düşük seviye BF testi atlandı (Redis istemcisi yok).")
 
+    # --- Kanıt 4: ömür URL başına (dilimli), sonunda silinir ---
+    if dedup._client is not None:
+        failures.extend(_check_lifetime())
+    else:
+        print("\n[i] Ömür testi atlandı (Redis istemcisi yok).")
+
     # --- Sonuç ---
     print("\n" + "=" * 50)
     if failures:
@@ -84,6 +93,43 @@ def main() -> int:
         return 1
     print("SONUC: BASARILI  Gercek RedisBloom yolu dogrulandi.")
     return 0
+
+
+def _check_lifetime() -> list[str]:
+    from core.dedup import Deduplicator
+
+    ttl, old_ttl = 4, settings.dedup_ttl_sec
+    settings.dedup_ttl_sec = ttl
+    try:
+        d = Deduplicator()
+        w = d._slice_width(ttl)
+        tag = f"verify-{os.getpid()}-{int(time.time())}"
+        a, b = f"https://verify.example/{tag}/A", f"https://verify.example/{tag}/B"
+        t0 = time.time()
+        d.mark(a)
+        time.sleep(3)
+        d.mark(b)
+        tb = time.time()
+        rows, errors = [], []
+        while time.time() - tb < ttl + w + 0.5:
+            age_a, age_b = time.time() - t0, time.time() - tb
+            sa, sb = d.seen(a), d.seen(b)
+            rows.append(f"  t={age_a:4.1f}s  seen(A)={sa!s:5}  seen(B)={sb!s:5}")
+            for name, age, seen_now in (("A", age_a, sa), ("B", age_b, sb)):
+                if age < ttl - 0.05 and not seen_now:
+                    errors.append(f"{name} {age:.1f} sn'de unutuldu (DEDUP_TTL={ttl})")
+                if age > ttl + w + 0.05 and seen_now:
+                    errors.append(f"{name} {age:.1f} sn'de hâlâ görüldü (üst sınır {ttl + w})")
+            time.sleep(0.5)
+        left = d._client.keys(f"{d.BLOOM_NAME}:{w}:*")
+        print(f"\nÖmür (DEDUP_TTL={ttl}, dilim={w} sn, beklenen ömür {ttl}-{ttl + w} sn):")
+        print("\n".join(rows))
+        print(f"Kalan dilim anahtarı: {len(left)}   (beklenen: 0)")
+        if left:
+            errors.append(f"süre dolduğu halde {len(left)} dilim anahtarı Redis'te kaldı")
+        return errors
+    finally:
+        settings.dedup_ttl_sec = old_ttl
 
 
 if __name__ == "__main__":

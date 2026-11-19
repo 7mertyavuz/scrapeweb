@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Derinlemesine savunma: satır içi betik/olay işleyicisi ve harici betik çalıştırılmaz. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+    <meta name="referrer" content="no-referrer">
     <title>ScrapeHub — Web Scraping Kontrol Paneli</title>
     <link rel="stylesheet" href="/static/styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -62,6 +65,17 @@
             </header>
 
             <div class="content">
+                <div id="auth-banner" class="auth-banner hidden" role="alert">
+                    <div class="auth-banner-icon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    </div>
+                    <div class="auth-banner-text">
+                        <div id="auth-banner-title" class="auth-banner-title">API anahtarı gerekli</div>
+                        <div id="auth-banner-message" class="auth-banner-message"></div>
+                    </div>
+                    <button id="auth-banner-focus" class="btn btn-sm" type="button">Anahtarı gir</button>
+                </div>
+
                 <!-- Dashboard -->
                 <section id="page-dashboard" class="page active">
                     <div class="stats-grid">

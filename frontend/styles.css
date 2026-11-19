@@ -123,6 +123,14 @@ body {
     margin-bottom: 8px;
 }
 
+.api-key-box.needs-key input {
+    border-color: var(--warning);
+}
+
+.api-key-box.needs-key label {
+    color: var(--warning);
+}
+
 /* Main */
 .main {
     flex: 1;
@@ -150,6 +158,35 @@ body {
     padding: 28px;
     flex: 1;
 }
+
+/* Yetki uyarısı */
+.auth-banner {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    border-radius: var(--radius);
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    box-shadow: var(--shadow);
+}
+
+.auth-banner-icon {
+    width: 40px;
+    height: 40px;
+    flex-shrink: 0;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(245, 158, 11, 0.12);
+    color: var(--warning);
+}
+
+.auth-banner-text { flex: 1; }
+.auth-banner-title { font-weight: 600; font-size: 14px; color: var(--warning); }
+.auth-banner-message { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
 
 .page { display: none; }
 .page.active { display: block; }
