@@ -249,3 +249,177 @@ def test_allow_private_networks_escape_hatch(proxy, internal, monkeypatch):
 
 def test_parse_forward_spec():
     assert egress._parse_forward("3000=browserless:3000") == (3000, "browserless", 3000)
+
+
+# --------------------------------------------------------------------------
+# Gövdeli düz HTTP istekleri: gövde, yanıt beklenmeden hedefe aktarılır
+# --------------------------------------------------------------------------
+class _EchoServer(_Server):
+    """POST gövdesini (Content-Length ya da chunked) okuyup aynen geri yollar."""
+
+    def __init__(self, host: str):
+        received: list[bytes] = []
+        self.received = received
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                    data = b""
+                    while size := int(self.rfile.readline().split(b";")[0], 16):
+                        data += self.rfile.read(size)
+                        self.rfile.readline()
+                    self.rfile.readline()
+                else:
+                    data = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append(data)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.hits = []
+        self.httpd = _QuickHTTPServer((host, 0), Handler)
+        self.host, self.port = host, self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
+@pytest.fixture
+def echo():
+    srv = _EchoServer(FAKE_PUBLIC_IP)
+    yield srv
+    srv.close()
+
+
+@pytest.mark.parametrize("framing", ["content-length", "chunked"])
+def test_plain_http_request_body_is_forwarded(proxy, echo, framing):
+    import time
+
+    body = b"ad=deneme&not=" + b"x" * 5000
+    if framing == "chunked":
+        framed, header = b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body), "Transfer-Encoding: chunked"
+    else:
+        framed, header = body, f"Content-Length: {len(body)}"
+    raw = (f"POST http://{FAKE_PUBLIC_IP}:{echo.port}/post HTTP/1.1\r\nHost: x\r\n{header}\r\n"
+           "Content-Type: application/x-www-form-urlencoded\r\n\r\n").encode() + framed
+    t0 = time.monotonic()
+    resp = _send(proxy, raw)
+    assert resp.startswith(b"HTTP/1.1 200") and resp.endswith(body)
+    assert echo.received == [body]
+    assert time.monotonic() - t0 < 2
+
+
+# --------------------------------------------------------------------------
+# Bağlantı yerleri: istemcisi gitmiş ya da boşta kalan bağlantı yer tutmaz
+# --------------------------------------------------------------------------
+class _RawServer:
+    """Her bağlantıyı ``serve(conn)`` ile karşılayan çıplak TCP sunucusu (varsayılan: hiç yanıt vermez)."""
+
+    def __init__(self, host: str, serve=None):
+        self.sock = socket.create_server((host, 0))
+        self.host, self.port = host, self.sock.getsockname()[1]
+        self.conns: list[socket.socket] = []
+        self._serve = serve or (lambda conn: None)
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.conns.append(conn)
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def close(self):
+        self.sock.close()
+        for conn in self.conns:
+            conn.close()
+
+
+@pytest.fixture
+def silent():
+    srv = _RawServer(FAKE_PUBLIC_IP)
+    yield srv
+    srv.close()
+
+
+@pytest.fixture
+def few_slots(monkeypatch):
+    """``proxy`` fikstüründen ÖNCE istenmeli: semafor bu değerle kurulur."""
+    monkeypatch.setattr(egress, "MAX_CLIENTS", 4)
+
+
+def _wait_until(predicate, timeout: float = 3.0) -> bool:
+    import time
+
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("kind", ["http", "connect"])
+def test_client_that_left_frees_its_slot(few_slots, proxy, silent, public, kind):
+    """Yanıt vermeyen hedefe istek atıp giden istemciler proxy'yi başkalarına kapatmaz."""
+    authority = f"{FAKE_PUBLIC_IP}:{silent.port}"
+    for _ in range(egress.MAX_CLIENTS):
+        with socket.create_connection(proxy, timeout=5) as s:
+            if kind == "http":
+                s.sendall(_get(f"http://{authority}/asili"))
+            else:
+                s.sendall(_connect(authority))
+                assert s.recv(4096).startswith(b"HTTP/1.1 200")
+            assert _wait_until(lambda: len(silent.conns) > 0)
+    page = _get(f"http://{FAKE_PUBLIC_IP}:{public.port}/page")
+    assert _wait_until(lambda: _send(proxy, page).endswith(b"genel-sayfa")), "yerler serbest kalmalı"
+
+
+@pytest.mark.parametrize("kind", ["http", "connect"])
+def test_idle_connection_is_closed(proxy, silent, monkeypatch, kind):
+    """İstemci bağlı kalsa da iki yönde veri akmayan bağlantı IDLE_TIMEOUT sonunda kapanır."""
+    import time
+
+    monkeypatch.setattr(egress, "IDLE_TIMEOUT", 0.3)
+    authority = f"{FAKE_PUBLIC_IP}:{silent.port}"
+    with socket.create_connection(proxy, timeout=5) as s:
+        t0 = time.monotonic()
+        if kind == "http":
+            s.sendall(_get(f"http://{authority}/asili"))
+        else:
+            s.sendall(_connect(authority))
+            assert s.recv(4096).startswith(b"HTTP/1.1 200")
+        rest = b""
+        while chunk := s.recv(4096):   # proxy kapatana kadar (socket zaman aşımı 5 sn)
+            rest += chunk
+        assert time.monotonic() - t0 < 2
+        assert rest == b""
+
+
+def test_active_slow_stream_is_not_cut(proxy, monkeypatch):
+    """Veri akan bağlantı, toplam süresi IDLE_TIMEOUT'u aşsa da kesilmez."""
+    import time
+
+    monkeypatch.setattr(egress, "IDLE_TIMEOUT", 0.3)
+    parts = 8
+
+    def trickle(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % parts)
+        for _ in range(parts):
+            time.sleep(0.15)   # her parça arası < IDLE_TIMEOUT, toplam > IDLE_TIMEOUT
+            conn.sendall(b"x")
+        conn.close()
+
+    srv = _RawServer(FAKE_PUBLIC_IP, serve=trickle)
+    try:
+        resp = _send(proxy, _get(f"http://{FAKE_PUBLIC_IP}:{srv.port}/akan"))
+    finally:
+        srv.close()
+    assert resp.startswith(b"HTTP/1.1 200") and resp.endswith(b"x" * parts)

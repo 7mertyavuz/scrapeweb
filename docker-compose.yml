@@ -11,9 +11,11 @@
 #   - API'yi ağa açmak isterseniz .env içinde API_BIND_ADDR=0.0.0.0 yapın
 #     (API, API_KEY ile korunur).
 #   - Ağ ayrımı (tarayıcı yolunun SSRF koruması): browserless yalnız `browser`
-#     ağındadır ve bu ağ `internal`dır: oradan internete, host'a (yayımlanmış
-#     portlar, host.docker.internal) ve `backend` ağına (Redis/Postgres/Jaeger/
-#     Flower/API) yol yoktur. Tarayıcının tek çıkışı `egress` servisidir
+#     ağındadır ve bu ağ `internal`dır: oradan internete ve `backend` ağına
+#     (Redis/Postgres/Jaeger/Flower/API) yol yoktur. Host'un bu ağda yine bir
+#     ağ geçidi adresi var (Docker Desktop'ta oraya TCP bağlantısı reddedildi;
+#     Linux'ta host'un 0.0.0.0 servislerine erişim denenmedi). Tarayıcının
+#     internete tek çıkışı `egress` servisidir
 #     (core/egress_proxy.py): her bağlantının hedefini netguard ile denetler,
 #     iç/özel adresleri reddeder ve denetlenen IP'ye bağlanır. Worker,
 #     browserless'a bağlanmak için `browser` ağında da bulunur.
@@ -34,7 +36,7 @@ x-app-env: &app-env
 networks:
   # Uygulama servisleri ve veri katmanı.
   backend:
-  # browserless + worker + egress. internal: bu ağdan dışarıya (internet, host) yol yok.
+  # browserless + worker + egress. internal: bu ağdan internete yol yok (host: yukarıdaki not).
   browser:
     internal: true
   # Yalnız egress proxy'sinin internete çıkışı.

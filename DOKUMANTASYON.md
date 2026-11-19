@@ -321,7 +321,10 @@ gerek yoktur. Onun yerine **sağlam mühendislik**:
   denetimi kalır).
 - **Tarayıcı/AI modu (`core/browser.py`, `core/egress_proxy.py`):** Koruma ağ katmanındadır.
   Compose'da browserless yalnız `internal` olan `browser` ağındadır (worker ve `egress` ile
-  birlikte): internete, host'a ve `backend` ağına (Redis/Postgres/Jaeger/Flower/API) yolu yoktur.
+  birlikte): internete ve `backend` ağına (Redis/Postgres/Jaeger/Flower/API) yolu yoktur. Host'tan
+  tamamen kopuk değildir: ağın Docker host'unda bir ağ geçidi adresi vardır; Docker Desktop'ta
+  browserless'tan bu adrese TCP bağlantısı reddedildi (orada yanıt veren bir ağ yığını var), Linux'ta
+  host'ta `0.0.0.0`'a bağlı servislere bu yoldan ulaşılıp ulaşılamadığı denenmedi.
   Tek çıkışı `egress` servisidir: tarayıcı bağlamı (`BROWSER_EGRESS_PROXY`) tüm trafiğini ona
   yollar (HTTPS ve WebSocket için `CONNECT`, düz HTTP için mutlak URL'li istek). Proxy her
   bağlantının hedefini `check_url` ile denetler (iç/özel adres, tek etiketli ad → `403`) ve
@@ -329,7 +332,9 @@ gerek yoktur. Onun yerine **sağlam mühendislik**:
   tarayıcının kendi ağ yığınıyla, ama tek tek denetlenerek gider (DNS rebinding yok: adı
   proxy bir kez çözer). Hedef URL tarayıcıya verilmeden önce worker'da da denetlenir, gezinmenin
   yönlendirme zinciri sonradan kontrol edilir; service worker'lar kapalıdır. Tüm oturum
-  1,5 × `REQUEST_TIMEOUT` sonunda kesilir (ana iş parçacığını kilitleyen sayfaya karşı).
+  (browserless'a bağlanma dahil) 1,5 × `REQUEST_TIMEOUT` sonunda kesilir (ana iş parçacığını
+  kilitleyen sayfaya karşı). Proxy bir bağlantıyı istemcisi gidince hemen, iki yönde de 60 sn veri
+  akmazsa da kapatır; düz HTTP'de istek gövdesi yanıt beklenmeden aktarılır.
   `BROWSER_EGRESS_PROXY` boşsa (compose dışı) yalnız uygulama içi URL süzgeci çalışır. Kalan
   sınırlar README'deki "Known limitations" listesindedir.
 

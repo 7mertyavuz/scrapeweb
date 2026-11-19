@@ -1,12 +1,18 @@
 """
 Tarayıcının (browserless) internete tek çıkış noktası: SSRF denetimli HTTP proxy'si.
 
-Compose'da browserless yalnız ``internal: true`` olan ``browser`` ağındadır: internete,
-host'a ve diğer ağlara yolu yoktur. Bu süreç hem o ağda hem internete açık ``outbound``
-ağındadır; tarayıcı bağlamı (core/browser.py) bütün trafiğini buraya yollar:
+Compose'da browserless yalnız ``internal: true`` olan ``browser`` ağındadır: internete ve
+diğer ağlara yolu yoktur (host'un o ağda bir ağ geçidi adresi vardır; bkz. README). Bu süreç
+hem o ağda hem internete açık ``outbound`` ağındadır; tarayıcı bağlamı (core/browser.py)
+bütün trafiğini buraya yollar:
 
 * HTTPS ve WebSocket (ws/wss): ``CONNECT ad:port`` tüneli;
-* düz HTTP: ``GET http://ad/yol`` biçiminde istek (bağlantı başına bir istek).
+* düz HTTP: ``GET http://ad/yol`` biçiminde istek (bağlantı başına bir istek; gövde,
+  Content-Length ya da chunked, ayrıştırılmadan ve yanıt beklenmeden aktarılır).
+
+Bağlantı yerleri (MAX_CLIENTS): istemci gidince bağlantı hemen bırakılır; iki yönde de
+IDLE_TIMEOUT boyunca veri akmazsa (yanıt başlığı beklenirken de) kapanır; veri akan
+bağlantının üst sınırı MAX_TUNNEL_SECONDS'tır.
 
 Her bağlantıda hedef ``netguard.check_url`` ile denetlenir (ad çözülür; çözülen
 adreslerden biri bile iç/özel ise red) ve TCP bağlantısı DENETLENEN IP'ye açılır; böylece
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 from urllib.parse import urlsplit
 
 from core.config import settings
@@ -38,6 +45,7 @@ DEFAULT_PORT = 8899
 MAX_HEAD_BYTES = 64 * 1024     # istek/yanıt başlık bloğu üst sınırı
 HEAD_TIMEOUT = 30              # istemcinin başlıkları göndermesi için süre (sn)
 CONNECT_TIMEOUT = 10           # hedefe TCP bağlantısı için süre (sn)
+IDLE_TIMEOUT = 60              # iki yönde de veri akmazsa bağlantı kapanır (yanıt beklerken de)
 MAX_TUNNEL_SECONDS = 15 * 60   # tek bir bağlantının en uzun ömrü (sızıntıya karşı)
 MAX_CLIENTS = 512              # eşzamanlı bağlantı sınırı
 
@@ -65,22 +73,53 @@ async def _reply(writer: asyncio.StreamWriter, status: int, reason: str) -> None
         pass
 
 
-async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, seen: list[float]) -> None:
+    """``src``'den ``dst``'ye aktar; her veri geldiğinde ``seen[0]``'ı (son etkinlik) güncelle."""
     try:
         while data := await src.read(65536):
+            seen[0] = time.monotonic()
             dst.write(data)
             await dst.drain()
     except OSError:
         pass
 
 
-async def _relay(c_reader, c_writer, u_reader, u_writer) -> None:
-    """İki yönü aktar; bir taraf kapanınca (ya da süre dolunca) ikisini de bırak."""
-    tasks = [asyncio.create_task(_pipe(c_reader, u_writer)), asyncio.create_task(_pipe(u_reader, c_writer))]
-    _, pending = await asyncio.wait(tasks, timeout=MAX_TUNNEL_SECONDS, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+async def _relay(c_reader, c_writer, u_reader, u_writer, *, downstream=_pipe, idle=True) -> None:
+    """İki yönü aktar; ikisini de bırak: bir taraf kapanınca (istemci gittiyse hemen),
+    ``idle`` iken iki yönde de IDLE_TIMEOUT boyunca veri akmayınca ya da MAX_TUNNEL_SECONDS
+    dolunca. ``downstream``: hedef→istemci yönünü aktaran işlev (düz HTTP başlığı ayıklar)."""
+    seen = [time.monotonic()]
+    end = seen[0] + MAX_TUNNEL_SECONDS
+    tasks = [asyncio.create_task(_pipe(c_reader, u_writer, seen)),
+             asyncio.create_task(downstream(u_reader, c_writer, seen))]
+    try:
+        while True:
+            until = min(end, seen[0] + IDLE_TIMEOUT) if idle else end
+            if until <= time.monotonic():
+                break
+            done, _ = await asyncio.wait(tasks, timeout=until - time.monotonic(),
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if done:
+                break
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _http_response(u_reader: asyncio.StreamReader, c_writer: asyncio.StreamWriter, seen: list[float]) -> None:
+    """Düz HTTP'de hedef→istemci yönü: yanıt başlığından bağlantıya özgü başlıkları at,
+    ``Connection: close`` ekle (bağlantı başına tek istek: tarayıcı bu bağlantıyı başka bir
+    hedef için yeniden kullanmasın), sonra gövdeyi olduğu gibi aktar."""
+    try:
+        head = await u_reader.readuntil(b"\r\n\r\n")
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
+        return await _reply(c_writer, 502, "Bad Gateway")
+    seen[0] = time.monotonic()
+    lines = head.decode("latin-1").split(_CRLF)
+    kept = _strip_headers(lines[1:], _HOP_HEADERS)
+    c_writer.write(_CRLF.join([lines[0], *kept, "Connection: close", "Proxy-Connection: close", "", ""]).encode("latin-1"))
+    await _pipe(u_reader, c_writer, seen)
 
 
 async def _open_checked(url: str):
@@ -122,6 +161,7 @@ async def _handle(c_reader: asyncio.StreamReader, c_writer: asyncio.StreamWriter
     except ValueError:
         return await _reply(c_writer, 400, "Bad Request")
 
+    downstream = _pipe
     if method.upper() == "CONNECT":
         # HTTPS ve WebSocket tünelleri. Şema yalnız biçimsel; bağlanılan port denetlenen porttur.
         opened, error = await _open_checked(f"https://{target}/")
@@ -146,20 +186,12 @@ async def _handle(c_reader: asyncio.StreamReader, c_writer: asyncio.StreamWriter
         headers = _strip_headers(lines[1:], _HOP_HEADERS | {"host"})
         request = [f"{method} {path} {version}", f"Host: {urlsplit(checked.request_url).netloc}", *headers]
         u_writer.write(_CRLF.join([*request, "Connection: close", "", ""]).encode("latin-1"))
-        try:
-            resp_head = await asyncio.wait_for(u_reader.readuntil(b"\r\n\r\n"), MAX_TUNNEL_SECONDS)
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
-            u_writer.close()
-            return await _reply(c_writer, 502, "Bad Gateway")
-        # Bağlantı başına tek istek: tarayıcı bu bağlantıyı başka bir hedef için yeniden kullanmasın.
-        resp_lines = resp_head.decode("latin-1").split(_CRLF)
-        kept = _strip_headers(resp_lines[1:], _HOP_HEADERS)
-        c_writer.write(_CRLF.join(
-            [resp_lines[0], *kept, "Connection: close", "Proxy-Connection: close", "", ""]
-        ).encode("latin-1"))
+        # Gövde (Content-Length ya da chunked; ayrıştırılmaz) yanıt beklenmeden, istemciden
+        # okundukça aktarılır; yanıt başlığı _http_response'ta ayıklanır.
+        downstream = _http_response
 
     try:
-        await _relay(c_reader, c_writer, u_reader, u_writer)
+        await _relay(c_reader, c_writer, u_reader, u_writer, downstream=downstream)
     finally:
         u_writer.close()
 
@@ -183,7 +215,8 @@ async def _serve_forward(c_reader, c_writer, host: str, port: int) -> None:
         c_writer.close()
         return
     try:
-        await _relay(c_reader, c_writer, u_reader, u_writer)
+        # Politika dışı denetim kanalı (CDP): boşta kalması olağan, boşta süresi uygulanmaz.
+        await _relay(c_reader, c_writer, u_reader, u_writer, idle=False)
     finally:
         u_writer.close()
         c_writer.close()
