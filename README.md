@@ -191,6 +191,8 @@ Known limitations:
 - When a proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) is used, IP pinning and the connected-IP check are not applied.
 - There is no rate limiting.
 - `/docs` (OpenAPI UI) is public.
+- The egress proxy forwards plain-HTTP traffic as a byte stream after the first request: if a target answers with an interim (1xx) response, the browser may reuse that connection and send further requests to the same already-checked public address without a new check. Internal addresses stay unreachable.
+- The egress proxy resolves names on a small thread pool: a page that opens many connections to names with a slow DNS server can delay other browser sessions for a while.
 
 **Upgrading:** older versions documented a fixed default API key. It is now always rejected; if you deployed with it, set a new random `API_KEY`. Older versions also kept deduplication in a single `scrapehub:seen_urls` key that never expires; the new code ignores it, and you can delete it with `docker compose exec redis redis-cli DEL scrapehub:seen_urls`.
 

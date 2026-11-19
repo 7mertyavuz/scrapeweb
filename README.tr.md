@@ -191,6 +191,8 @@ Bilinen sınırlar:
 - Proxy (`PROXY_TIER_1`/`PROXY_TIER_2`) kullanılırken IP sabitleme ve bağlanılan IP denetimi uygulanmaz.
 - Hız sınırı (rate limiting) yoktur.
 - `/docs` (OpenAPI arayüzü) açıktır.
+- Çıkış proxy'si düz HTTP trafiğini ilk istekten sonra bayt akışı olarak aktarır: hedef ara (1xx) yanıt verirse tarayıcı o bağlantıyı yeniden kullanıp sonraki istekleri, yeni bir denetim olmadan, zaten denetlenmiş aynı genel adrese gönderebilir. İç adresler yine erişilemez.
+- Çıkış proxy'si adları küçük bir iş parçacığı havuzunda çözer: DNS sunucusu yavaş olan adlara çok sayıda bağlantı açan bir sayfa, diğer tarayıcı oturumlarını bir süre geciktirebilir.
 
 **Yükseltme:** Eski sürümler belgelerde sabit bir varsayılan API anahtarı yayımlıyordu. Bu anahtar artık her zaman reddedilir; onunla kurulum yaptıysanız yeni, rastgele bir `API_KEY` ayarlayın. Eski sürümler tekilleştirmeyi ömürsüz tek bir `scrapehub:seen_urls` anahtarında tutuyordu; yeni kod ona bakmaz, `docker compose exec redis redis-cli DEL scrapehub:seen_urls` ile silebilirsiniz.
 
